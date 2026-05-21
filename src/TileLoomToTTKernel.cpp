@@ -1,0 +1,1205 @@
+/**
+ * @file TileLoomToTTKernel.cpp
+ * @brief Main pass for converting TileLoom IR to TTKernel dialect.
+ */
+
+#include "ComputeOpToTTKernel.h"
+#include "MemoryOpToTTKernel.h"
+#include "SCFOpToTTKernel.h"
+#include "FuncOpToTTKernel.h"
+#include "TTKernelAttrs.h"
+#include "TTKernelUtils.h"
+#include "TileLoomToTTKernel.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/EmitC/IR/EmitC.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Func/Transforms/FuncConversions.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
+#include "mlir/Dialect/Bufferization/Transforms/Passes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/Passes.h"
+// TTKernel dialect (tt-mlir) for types/ops created by conversion patterns.
+#include "ttmlir/Dialect/TTKernel/IR/TTKernel.h"
+#include "ttmlir/Dialect/TTKernel/IR/TTKernelOps.h"
+#include "ttmlir/Dialect/TTKernel/IR/TTKernelOpsTypes.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/Support/CommandLine.h"
+#include <string>
+
+// Loom dialect headers for ::loom::AllocOp, ::loom::CopyOp, etc.
+#include "mlir/Interfaces/ViewLikeInterface.h"
+#include "LoomDialect.h.inc"
+#define GET_OP_CLASSES
+#include "LoomEnums.h.inc"
+#include "LoomAttributes.h.inc"
+#include "LoomInterfaces.h.inc"
+#include "LoomOps.h.inc"
+
+using namespace mlir;
+using namespace mlir::loom;
+using namespace tt::ttkernel;
+
+namespace {
+
+/**
+ * @brief Type converter for TileLoom to TTKernel conversion.
+ * 
+ * @details This type converter handles the conversion of memref types
+ *          to TTKernel CB types. MemRef types are converted to CBType,
+ *          which is the circular buffer type used in TTKernel dialect.
+ */
+class TileLoomTypeConverter : public TypeConverter {
+public:
+  TileLoomTypeConverter() {
+    // Default conversion: keep types as-is if no specific conversion matches
+    addConversion([](Type type) { return type; });
+    
+    // Convert MemRefType to CBType for circular buffers
+    addConversion([](MemRefType memref) -> std::optional<Type> {
+      if (!memref.hasStaticShape())
+        return std::nullopt;
+      // Convert memref to CBType. The CBType wraps the memref and stores
+      // the number of elements and element type.
+      return CBType::get(memref);
+    });
+    
+  }
+};
+
+/**
+ * @brief Erase architecture-description dialect operations from the module.
+ *
+ * @details This helper walks the module and removes every operation whose
+ *          dialect namespace is "df" or "adl". These ops describe topology /
+ *          memory hierarchy metadata and are not required after TTKernel
+ *          lowering.
+ *
+ * @param module The module in which to erase descriptor dialect operations.
+ */
+static void eraseDescriptorDialectOps(ModuleOp module) {
+  SmallVector<Operation *, 16> toErase;
+  module.walk([&](Operation *op) {
+    Dialect *dialect = op->getDialect();
+    if (dialect && (dialect->getNamespace() == StringRef("df") ||
+                    dialect->getNamespace() == StringRef("adl")))
+      toErase.push_back(op);
+  });
+
+  // Erase in reverse to avoid invalidating the IR while deleting.
+  for (auto *op : llvm::reverse(toErase))
+    op->erase();
+}
+
+static bool hasResultUsersOutside(Operation *op, Operation *scopeOp) {
+  for (Value result : op->getResults()) {
+    for (Operation *user : result.getUsers()) {
+      if (!scopeOp->isAncestor(user))
+        return true;
+    }
+  }
+  return false;
+}
+
+static bool isHostArtifactLoop(scf::ForOp forOp) {
+  for (Operation &inner : forOp.getBody()->without_terminator()) {
+    if (!isa<mlir::tt::ttkernel::GetArgValOp, arith::IndexCastOp>(inner))
+      return false;
+    if (hasResultUsersOutside(&inner, forOp))
+      return false;
+  }
+  return true;
+}
+
+static bool isGeneratedHostFuncName(StringRef name) {
+  return name.ends_with("__host") || name.ends_with("__host_cpp") ||
+         name.ends_with("__host_pybind");
+}
+
+static SmallVector<func::FuncOp, 8> collectAllFuncOps(ModuleOp module) {
+  SmallVector<func::FuncOp, 8> funcs;
+  module.walk([&](func::FuncOp func) { funcs.push_back(func); });
+  return funcs;
+}
+
+static void eraseHostLoweringArtifacts(ModuleOp module) {
+  for (func::FuncOp func : collectAllFuncOps(module)) {
+    StringRef name = func.getName();
+    if (!isGeneratedHostFuncName(name) && !name.ends_with("__writer") &&
+        !name.ends_with("__reader") && !name.ends_with("__compute"))
+      continue;
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      llvm::SetVector<Operation *> opsToErase;
+
+      func.walk([&](scf::ForOp forOp) {
+        if (isHostArtifactLoop(forOp))
+          opsToErase.insert(forOp);
+      });
+
+      func.walk([&](mlir::tt::ttkernel::GetArgValOp getArgOp) {
+        if (getArgOp.getResult().use_empty())
+          opsToErase.insert(getArgOp.getOperation());
+      });
+
+      func.walk([&](arith::IndexCastOp castOp) {
+        if (castOp.getResult().use_empty())
+          opsToErase.insert(castOp);
+      });
+
+      if (opsToErase.empty())
+        break;
+
+      changed = true;
+      for (Operation *op : llvm::reverse(opsToErase))
+        op->erase();
+    }
+  }
+}
+
+static bool isKernelRuntimeSetupCleanupTarget(func::FuncOp func) {
+  StringRef name = func.getName();
+  return name.ends_with("__reader") || name.ends_with("__compute") ||
+         name.ends_with("__writer");
+}
+
+static bool isDeadRemovableRuntimeSetupOp(Operation *op) {
+  if (!op || op->getNumRegions() != 0)
+    return false;
+
+  if (op->getNumResults() == 0)
+    return false;
+
+  if (!llvm::all_of(op->getResults(),
+                    [](Value result) { return result.use_empty(); }))
+    return false;
+
+  return isa<GetSemaphoreOp, TensorAccessorArgsOp, TensorAccessorOp, GetNocAddrOp,
+             ExperimentalGetNocMulticastAddrOp, CastToL1PtrOp, GetTileSizeOp,
+             GetArgValOp, arith::IndexCastOp>(op);
+}
+
+static void eraseDeadRuntimeSetupArtifacts(ModuleOp module) {
+  for (func::FuncOp func : collectAllFuncOps(module)) {
+    if (!isKernelRuntimeSetupCleanupTarget(func))
+      continue;
+
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      llvm::SetVector<Operation *> opsToErase;
+
+      func.walk([&](Operation *op) {
+        if (isDeadRemovableRuntimeSetupOp(op))
+          opsToErase.insert(op);
+      });
+
+      if (opsToErase.empty())
+        break;
+
+      changed = true;
+      for (Operation *op : llvm::reverse(opsToErase))
+        op->erase();
+    }
+  }
+}
+
+static void eraseLoomLoopAttrs(ModuleOp module) {
+  auto erasePrefixedAttrs = [](Operation *op) {
+    SmallVector<StringAttr, 8> attrsToErase;
+    for (NamedAttribute namedAttr : op->getAttrs()) {
+      if (namedAttr.getName().strref().starts_with("loom."))
+        attrsToErase.push_back(namedAttr.getName());
+    }
+    for (StringAttr attrName : attrsToErase)
+      op->removeAttr(attrName);
+  };
+
+  module.walk([&](scf::ForOp forOp) { erasePrefixedAttrs(forOp.getOperation()); });
+  module.walk([&](scf::ParallelOp parOp) {
+    erasePrefixedAttrs(parOp.getOperation());
+  });
+}
+
+static LogicalResult rewriteMatmulToBatch1Matmul(ModuleOp module) {
+  SmallVector<linalg::MatmulOp> matmuls;
+  module.walk([&](linalg::MatmulOp op) { matmuls.push_back(op); });
+
+  for (linalg::MatmulOp op : matmuls) {
+    auto lhsTy = dyn_cast<MemRefType>(op.getInputs()[0].getType());
+    auto rhsTy = dyn_cast<MemRefType>(op.getInputs()[1].getType());
+    auto outTy = dyn_cast<MemRefType>(op.getOutputs()[0].getType());
+    if (!lhsTy || !rhsTy || !outTy || lhsTy.getRank() != 2 ||
+        rhsTy.getRank() != 2 || outTy.getRank() != 2)
+      continue;
+
+    auto makeBatch1Type = [&](MemRefType srcTy) -> MemRefType {
+      int64_t dim0 = srcTy.isDynamicDim(0) ? ShapedType::kDynamic
+                                           : srcTy.getDimSize(0);
+      int64_t dim1 = srcTy.isDynamicDim(1) ? ShapedType::kDynamic
+                                           : srcTy.getDimSize(1);
+      return MemRefType::get({1, dim0, dim1}, srcTy.getElementType(),
+                             AffineMap(), srcTy.getMemorySpace());
+    };
+
+    SmallVector<ReassociationIndices> reassociation = {{0, 1}, {2}};
+    OpBuilder builder(op);
+    Value lhs3D = builder.create<memref::ExpandShapeOp>(
+        op.getLoc(), makeBatch1Type(lhsTy), op.getInputs()[0], reassociation);
+    Value rhs3D = builder.create<memref::ExpandShapeOp>(
+        op.getLoc(), makeBatch1Type(rhsTy), op.getInputs()[1], reassociation);
+    Value out3D = builder.create<memref::ExpandShapeOp>(
+        op.getLoc(), makeBatch1Type(outTy), op.getOutputs()[0], reassociation);
+
+    builder.create<linalg::BatchMatmulOp>(op.getLoc(),
+                                          ValueRange{lhs3D, rhs3D},
+                                          ValueRange{out3D});
+    op.erase();
+  }
+
+  return success();
+}
+
+static LogicalResult rewriteLoomMatmulToBatch1LoomBatchMatmul(ModuleOp module) {
+  SmallVector<::loom::MatmulOp> loomMatmuls;
+  module.walk([&](::loom::MatmulOp op) { loomMatmuls.push_back(op); });
+
+  for (::loom::MatmulOp op : loomMatmuls) {
+    auto lhsTy = dyn_cast<MemRefType>(op.getLhs().getType());
+    auto rhsTy = dyn_cast<MemRefType>(op.getRhs().getType());
+    auto outTy = dyn_cast<MemRefType>(op.getOuts().getType());
+    if (!lhsTy || !rhsTy || !outTy || lhsTy.getRank() != 2 ||
+        rhsTy.getRank() != 2 || outTy.getRank() != 2)
+      continue;
+
+    auto makeBatch1Type = [&](MemRefType srcTy) -> MemRefType {
+      int64_t dim0 = srcTy.isDynamicDim(0) ? ShapedType::kDynamic
+                                           : srcTy.getDimSize(0);
+      int64_t dim1 = srcTy.isDynamicDim(1) ? ShapedType::kDynamic
+                                           : srcTy.getDimSize(1);
+      return MemRefType::get({1, dim0, dim1}, srcTy.getElementType(),
+                             AffineMap(), srcTy.getMemorySpace());
+    };
+
+    SmallVector<ReassociationIndices> reassociation = {{0, 1}, {2}};
+    OpBuilder builder(op);
+    Value lhs3D = builder.create<memref::ExpandShapeOp>(
+        op.getLoc(), makeBatch1Type(lhsTy), op.getLhs(), reassociation);
+    Value rhs3D = builder.create<memref::ExpandShapeOp>(
+        op.getLoc(), makeBatch1Type(rhsTy), op.getRhs(), reassociation);
+    Value out3D = builder.create<memref::ExpandShapeOp>(
+        op.getLoc(), makeBatch1Type(outTy), op.getOuts(), reassociation);
+
+    builder.create<::loom::BatchMatmulOp>(op.getLoc(), lhs3D, rhs3D, out3D);
+    op.erase();
+  }
+
+  return success();
+}
+
+static bool isComputeKernelFunc(func::FuncOp func) {
+  if (auto threadAttr =
+          func->getAttrOfType<ThreadTypeAttr>(ThreadTypeAttr::name)) {
+    return threadAttr.getValue() == ThreadType::Compute;
+  }
+  return func.getName().ends_with("__compute");
+}
+
+static FailureOr<std::pair<int64_t, MemRefType>>
+resolveInternalSemaphoreSlotAndType(Value value) {
+  if (!value)
+    return failure();
+
+  Value endpoint = stripBindingLookupWrappers(value);
+  if (auto sem = endpoint.getDefiningOp<::loom::SemaphoreTakeOp>()) {
+    auto slotAttr = sem->getAttrOfType<IntegerAttr>(kSemaphoreSlotAttrName);
+    auto memrefType = dyn_cast<MemRefType>(sem.getResult().getType());
+    if (!slotAttr || !memrefType)
+      return failure();
+    return std::make_pair(slotAttr.getInt(), memrefType);
+  }
+
+  if (auto alloc = endpoint.getDefiningOp<::loom::AllocOp>()) {
+    std::optional<std::pair<int64_t, MemRefType>> resolved;
+    for (Operation *user : alloc.getResult().getUsers()) {
+      auto sem = dyn_cast<::loom::SemaphoreTakeOp>(user);
+      if (!sem)
+        continue;
+      auto slotAttr = sem->getAttrOfType<IntegerAttr>(kSemaphoreSlotAttrName);
+      auto memrefType = dyn_cast<MemRefType>(sem.getResult().getType());
+      if (!slotAttr || !memrefType)
+        continue;
+      if (resolved && resolved->first != slotAttr.getInt())
+        return failure();
+      resolved = std::make_pair(slotAttr.getInt(), memrefType);
+    }
+    if (resolved)
+      return *resolved;
+  }
+
+  return failure();
+}
+
+struct MatmulLikeOperands {
+  Value lhs;
+  Value rhs;
+  Value out;
+};
+
+static std::optional<MatmulLikeOperands>
+getMatmulLikeOperands(Operation *op) {
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    if (linalgOp.getDpsInputs().size() < 2 ||
+        linalgOp.getDpsInits().empty())
+      return std::nullopt;
+    return MatmulLikeOperands{linalgOp.getDpsInputs()[0],
+                              linalgOp.getDpsInputs()[1],
+                              linalgOp.getDpsInits()[0]};
+  }
+
+  if (auto loomMatmul = dyn_cast<::loom::MatmulOp>(op))
+    return MatmulLikeOperands{loomMatmul.getLhs(), loomMatmul.getRhs(),
+                              loomMatmul.getOuts()};
+
+  if (auto loomBatchMatmul = dyn_cast<::loom::BatchMatmulOp>(op))
+    return MatmulLikeOperands{loomBatchMatmul.getLhs(),
+                              loomBatchMatmul.getRhs(),
+                              loomBatchMatmul.getOuts()};
+
+  return std::nullopt;
+}
+
+static FailureOr<ReduceProtocol>
+parseReduceProtocolOption(StringRef optionValue) {
+  std::string lowered = optionValue.trim().lower();
+  StringRef value(lowered);
+  if (value.empty() || value == "multi-slot")
+    return ReduceProtocol::MultiSlot;
+  if (value == "single-slot")
+    return ReduceProtocol::SingleSlot;
+  return failure();
+}
+
+class InsertMMInitPass
+    : public PassWrapper<InsertMMInitPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(InsertMMInitPass)
+
+  StringRef getArgument() const override {
+    return "loom-insert-mm-init";
+  }
+
+  StringRef getDescription() const override {
+    return "Insert a single ttkernel.mm_init after parameter GetArgValOps in compute kernels";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<func::FuncDialect, linalg::LinalgDialect,
+                    ::loom::LoomDialect,
+                    arith::ArithDialect, emitc::EmitCDialect,
+                    mlir::tt::ttkernel::TTKernelDialect>();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+
+    for (func::FuncOp func : collectAllFuncOps(module)) {
+      if (!isComputeKernelFunc(func))
+        continue;
+
+      Operation *targetMatmulOp = nullptr;
+      func.walk([&](Operation *op) {
+        if (targetMatmulOp)
+          return;
+        if (isa<linalg::MatmulOp, linalg::BatchMatmulOp, ::loom::MatmulOp,
+                ::loom::BatchMatmulOp>(op))
+          targetMatmulOp = op;
+      });
+      if (!targetMatmulOp)
+        continue;
+
+      bool hasMMInit = false;
+      func.walk([&](MatmulInitOp) { hasMMInit = true; });
+      if (hasMMInit)
+        continue;
+
+      Block &entry = func.front();
+      int64_t copyBindingCount = getAnnotatedCopyBindingCount(func);
+
+      llvm::DenseMap<int64_t, Value> bindingSlotToCB;
+      llvm::DenseMap<int64_t, MemRefType> bindingSlotToCBMemrefType;
+      llvm::DenseMap<int64_t, int64_t> bindingSlotToCBIndex;
+      Operation *lastParamMaterialization = nullptr;
+      for (Operation &op : entry) {
+        auto getArgVal = dyn_cast<GetArgValOp>(op);
+        auto getCompileArgVal = dyn_cast<GetCompileArgValOp>(op);
+        if (getArgVal || getCompileArgVal)
+          lastParamMaterialization = &op;
+        if (!getCompileArgVal || !isa<CBType>(getCompileArgVal.getType()))
+          continue;
+        if (auto slotAttr = getCompileArgVal->getAttrOfType<IntegerAttr>(
+                kCBConstBindingSlotAttrName))
+          bindingSlotToCB.try_emplace(slotAttr.getInt(),
+                                      getCompileArgVal.getResult());
+      }
+
+      auto createCBConst = [&](int64_t cbIndex, StringRef name,
+                               MemRefType memrefType,
+                               std::optional<int64_t> bindingSlot,
+                               std::optional<int64_t> internalSlot)
+          -> FailureOr<Value> {
+        OpBuilder constBuilder(func.getContext());
+        return getOrCreateCBConst(func.getLoc(), constBuilder, func, cbIndex,
+                                  name, CBType::get(memrefType), bindingSlot,
+                                  internalSlot);
+      };
+
+      llvm::DenseMap<Value, int64_t> inputEndpointToSlot;
+      llvm::DenseMap<Value, int64_t> outputEndpointToSlot;
+      LogicalResult bindingStatus = success();
+      func.walk([&](::loom::CopyOp copyOp) {
+        if (failed(bindingStatus))
+          return;
+        auto slot = getCopyBindingSlot(copyOp.getOperation());
+        if (!slot)
+          return;
+
+        if (auto cbMemrefType = getCopyBindingCBMemrefType(copyOp))
+          bindingSlotToCBMemrefType.try_emplace(*slot, cbMemrefType);
+        if (auto cbIndexAttr =
+                copyOp->getAttrOfType<IntegerAttr>(kCBIndexAttrName))
+          bindingSlotToCBIndex.try_emplace(*slot, cbIndexAttr.getInt());
+
+        auto recordEndpoint =
+            [&](Value endpoint, llvm::DenseMap<Value, int64_t> &map,
+                StringRef kind) {
+              if (!endpoint) {
+                bindingStatus = copyOp.emitOpError()
+                                << "failed to resolve " << kind
+                                << " endpoint for copy binding slot " << *slot;
+                return;
+              }
+              auto [it, inserted] = map.try_emplace(endpoint, *slot);
+              if (!inserted && it->second != *slot) {
+                bindingStatus = copyOp.emitOpError()
+                                << "multiple copy binding slots map to the "
+                                << "same " << kind << " endpoint";
+              }
+            };
+
+        if (isDramToL1Copy(copyOp))
+          recordEndpoint(stripBindingLookupWrappers(copyOp.getDestination()),
+                         inputEndpointToSlot, "input");
+        if (isL1ToDramCopy(copyOp))
+          recordEndpoint(stripBindingLookupWrappers(copyOp.getSource()),
+                         outputEndpointToSlot, "output");
+      });
+
+      if (failed(bindingStatus)) {
+        signalPassFailure();
+        return;
+      }
+
+      for (int64_t slot = 0; slot < copyBindingCount; ++slot) {
+        if (bindingSlotToCB.contains(slot))
+          continue;
+        auto typeIt = bindingSlotToCBMemrefType.find(slot);
+        auto indexIt = bindingSlotToCBIndex.find(slot);
+        if (typeIt == bindingSlotToCBMemrefType.end() ||
+            indexIt == bindingSlotToCBIndex.end())
+          continue;
+        FailureOr<Value> cb =
+            createCBConst(indexIt->second,
+                          "cb_id_binding" + std::to_string(slot),
+                          typeIt->second, slot, std::nullopt);
+        if (failed(cb)) {
+          signalPassFailure();
+          return;
+        }
+        bindingSlotToCB.try_emplace(slot, *cb);
+      }
+
+      std::optional<MatmulLikeOperands> matmulOperands =
+          getMatmulLikeOperands(targetMatmulOp);
+      if (!matmulOperands) {
+        func.emitError()
+            << "expected matmul-like op with two inputs and one output for mm_init";
+        signalPassFailure();
+        return;
+      }
+
+      OpBuilder builder(func.getContext());
+      if (lastParamMaterialization)
+        builder.setInsertionPointAfter(lastParamMaterialization);
+      else
+        builder.setInsertionPointToStart(&entry);
+
+      auto getOrCreateInternalCb = [&](Value operand,
+                                       StringRef role) -> FailureOr<Value> {
+        FailureOr<std::pair<int64_t, MemRefType>> slotAndType =
+            resolveInternalSemaphoreSlotAndType(operand);
+        if (failed(slotAndType)) {
+          func.emitError() << "failed to resolve " << role
+                           << " internal semaphore CB for mm_init operand";
+          return failure();
+        }
+
+        int64_t slot = slotAndType->first;
+        MemRefType memrefType = slotAndType->second;
+        Value endpoint = stripBindingLookupWrappers(operand);
+        auto sem = endpoint.getDefiningOp<::loom::SemaphoreTakeOp>();
+        if (!sem) {
+          func.emitError() << "failed to resolve internal semaphore endpoint "
+                           << "for mm_init " << role;
+          return failure();
+        }
+        auto cbIndexAttr = sem->getAttrOfType<IntegerAttr>(kCBIndexAttrName);
+        if (!cbIndexAttr) {
+          func.emitError() << "missing static CB index for internal semaphore "
+                           << "slot " << slot << " while building mm_init "
+                           << role;
+          return failure();
+        }
+        return createCBConst(cbIndexAttr.getInt(),
+                             "cb_id_internal" + std::to_string(slot),
+                             memrefType, std::nullopt, slot);
+      };
+
+      auto resolveBindingCB = [&](Value operand,
+                                  const llvm::DenseMap<Value, int64_t> &endpointToSlot,
+                                  StringRef role) -> FailureOr<Value> {
+        Value endpoint = stripBindingLookupWrappers(operand);
+        auto slotIt = endpointToSlot.find(endpoint);
+        if (slotIt != endpointToSlot.end()) {
+          auto cbIt = bindingSlotToCB.find(slotIt->second);
+          if (cbIt == bindingSlotToCB.end()) {
+            func.emitError() << "missing CB get_arg_val for copy binding slot "
+                             << slotIt->second << " while building mm_init";
+            return failure();
+          }
+          return cbIt->second;
+        }
+        return getOrCreateInternalCb(endpoint, role);
+      };
+
+      FailureOr<Value> lhsCb =
+          resolveBindingCB(matmulOperands->lhs, inputEndpointToSlot, "lhs input");
+      FailureOr<Value> rhsCb =
+          resolveBindingCB(matmulOperands->rhs, inputEndpointToSlot, "rhs input");
+      FailureOr<Value> outputCb =
+          resolveBindingCB(matmulOperands->out, outputEndpointToSlot, "output");
+      if (failed(lhsCb) || failed(rhsCb) || failed(outputCb)) {
+        signalPassFailure();
+        return;
+      }
+
+      Value transpose = builder.create<arith::ConstantIntOp>(func.getLoc(), 0, 32);
+      builder.create<MatmulInitOp>(func.getLoc(), *lhsCb, *rhsCb, *outputCb,
+                                   transpose);
+    }
+  }
+};
+
+/**
+ * @brief Pass that converts TileLoom IR to TTKernel dialect.
+ * 
+ * @details This pass applies conversion patterns to transform TileLoom
+ *          operations (e.g., loom.alloc, loom.copy) into
+ *          TTKernel operations. It converts memref types to CBType and
+ *          handles function signature conversion.
+ */
+class TileLoomToTTKernelPass
+    : public PassWrapper<TileLoomToTTKernelPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TileLoomToTTKernelPass)
+
+  TileLoomToTTKernelPass()
+      : matmulMergeBReaderIntoWriter(
+            *this, "matmul-merge-b-reader-into-writer",
+            llvm::cl::desc(
+                "For linalg.matmul, keep the A reader on RISCV_1 and merge "
+                "the B reader into the writer kernel on RISCV_0"),
+            llvm::cl::init(false)),
+        reduceProtocolOpt(
+            *this, "reduce-protocol",
+            llvm::cl::desc("Reduce synchronization protocol "
+                           "(multi-slot|single-slot)"),
+            llvm::cl::init("multi-slot")),
+        reduceProtocolDeprecated(
+            *this, "reduce-sum-protocol",
+            llvm::cl::desc("[deprecated] Alias for reduce-protocol"),
+            llvm::cl::init("")) {}
+
+  TileLoomToTTKernelPass(const TileLoomToTTKernelPass &other)
+      : PassWrapper(other),
+        matmulMergeBReaderIntoWriter(
+            *this, "matmul-merge-b-reader-into-writer",
+            llvm::cl::desc(
+                "For linalg.matmul, keep the A reader on RISCV_1 and merge "
+                "the B reader into the writer kernel on RISCV_0"),
+            llvm::cl::init(false)),
+        reduceProtocolOpt(
+            *this, "reduce-protocol",
+            llvm::cl::desc("Reduce synchronization protocol "
+                           "(multi-slot|single-slot)"),
+            llvm::cl::init("multi-slot")),
+        reduceProtocolDeprecated(
+            *this, "reduce-sum-protocol",
+            llvm::cl::desc("[deprecated] Alias for reduce-protocol"),
+            llvm::cl::init("")) {
+    matmulMergeBReaderIntoWriter =
+        static_cast<bool>(other.matmulMergeBReaderIntoWriter);
+    reduceProtocolOpt = other.reduceProtocolOpt;
+    reduceProtocolDeprecated = other.reduceProtocolDeprecated;
+  }
+
+  StringRef getArgument() const override {
+    return "loom-tileloom-to-ttkernel";
+  }
+
+  StringRef getDescription() const override {
+    return "Convert TileLoom IR operations to TTKernel dialect";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<func::FuncDialect, memref::MemRefDialect,
+                    arith::ArithDialect, scf::SCFDialect,
+                    linalg::LinalgDialect>();
+    // Ensure TTKernel is loaded before patterns create TTKernel types (e.g.,
+    // DataFormatType). Otherwise, creating such types can fail with
+    // "storage uniquer isn't initialized".
+    registry.insert<mlir::tt::ttkernel::TTKernelDialect>();
+    // Ensure EmitC dialect is loaded for verbatim operations in host functions.
+    registry.insert<mlir::emitc::EmitCDialect>();
+    // Ensure Loom dialect is loaded for loom.alloc, loom.copy operations.
+    registry.insert<::loom::LoomDialect>();
+  }
+
+  Option<bool> matmulMergeBReaderIntoWriter;
+  Option<std::string> reduceProtocolOpt;
+  /// @deprecated Use reduce-protocol instead.
+  Option<std::string> reduceProtocolDeprecated;
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    MLIRContext *context = &getContext();
+
+    auto clearSwapDataMovementNocAttrs = [&]() {
+      module.walk([](Operation *op) {
+        op->removeAttr(kSwapDataMovementNocsAttrName);
+      });
+    };
+    clearSwapDataMovementNocAttrs();
+
+    // Preprocessing: hoist invariant allocs and simplify before lowering.
+    //
+    // This is useful to move loop-invariant `memref.alloc` ops outward (e.g.,
+    // out of `scf.for` nests) so the later TTKernel lowering sees fewer
+    // repeated allocations.
+    PassManager prePm(context);
+    prePm.addNestedPass<func::FuncOp>(
+        bufferization::createBufferLoopHoistingPass());
+    prePm.addNestedPass<func::FuncOp>(
+        bufferization::createBufferHoistingPass());
+    //prePm.addPass(createCanonicalizerPass());
+    if (failed(prePm.run(module))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Legacy reduce_sum is no longer supported in this lowering. The transport
+    // path is now gather-only and sum math is handled by linalg.generic.
+    bool sawLegacyReduceSum = false;
+    module.walk([&](::loom::ReduceSumOp op) {
+      if (sawLegacyReduceSum)
+        return;
+      sawLegacyReduceSum = true;
+      op.emitOpError("is unsupported by loom-tileloom-to-ttkernel; migrate to "
+                     "loom.gather + linalg.generic sum");
+    });
+    if (sawLegacyReduceSum) {
+      signalPassFailure();
+      return;
+    }
+
+    // Step 2: Specialize functions into compute/reader/writer variants.
+    // This clones each function into:
+    // - `__compute`: stores erased (compute-only)
+    // - `__reader` : stores + compute erased (loads-only)
+    // - `__writer` : loads  + compute erased (stores-only)
+    //
+    // This must run before MemoryOp/ComputeOp lowering so each specialized
+    // function is lowered independently.
+    if (matmulMergeBReaderIntoWriter) {
+      if (failed(prepareMatmulBReaderMerge(module))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    if (failed(annotateVecLoadUsage(module))) {
+      signalPassFailure();
+      return;
+    }
+
+    if (failed(specializeFunctionsForTTKernel(module))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Create shared compile-arg tracker for index management.
+    auto compileArgTracker = std::make_shared<CompileArgTracker>();
+
+    // Resolve reduce protocol option, preferring the deprecated alias when the
+    // primary option was left at its default and the alias was explicitly set.
+    std::string effectiveProtocolStr = reduceProtocolOpt;
+    if (!reduceProtocolDeprecated.getValue().empty())
+      effectiveProtocolStr = reduceProtocolDeprecated;
+
+    FailureOr<ReduceProtocol> reduceProtocol =
+        parseReduceProtocolOption(effectiveProtocolStr);
+    if (failed(reduceProtocol)) {
+      module.emitError() << "invalid reduce-protocol option: '"
+                         << effectiveProtocolStr
+                         << "' (expected 'multi-slot' or 'single-slot')";
+      signalPassFailure();
+      return;
+    }
+
+    // Create type converter (needed for memref -> CB conversion).
+    TileLoomTypeConverter typeConverter;
+
+    // Step 3: Run a per-function DSE-style cleanup after splitting.
+    //
+    // The specialization step above can leave behind dead ops (e.g. allocs,
+    // casts, unused loop-carried values). Run a small cleanup pipeline on each
+    // function to simplify IR before the TTKernel lowering patterns run.
+    // NOTE: This MUST run BEFORE replaceFuncArgsWithCompileArgs because
+    // the cleanup passes may modify the IR, which would invalidate any
+    // values stored in the tracker.
+    PassManager postSplitPm(context);
+    postSplitPm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    postSplitPm.addNestedPass<func::FuncOp>(createCSEPass());
+    // Symbol DCE cleans up any now-unreferenced symbols at the module level.
+    postSplitPm.addPass(createSymbolDCEPass());
+    if (failed(postSplitPm.run(module))) {
+      signalPassFailure();
+      return;
+    }
+
+    if (failed(rewriteMatmulToBatch1Matmul(module))) {
+      signalPassFailure();
+      return;
+    }
+    if (failed(rewriteLoomMatmulToBatch1LoomBatchMatmul(module))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Step 3.5: Replace index-type function arguments with GetArgValOp.
+    // For each function, insert GetArgValOp at the beginning of the
+    // function body to materialize compile-time arguments:
+    // - Index types: GetArgValOp returning i32, then cast to index
+    // - Memref types (DRAM pointers): create CB and base address values
+    // This is done AFTER cleanup passes to avoid dangling value references.
+    OpBuilder builder(context);
+    for (func::FuncOp func : collectAllFuncOps(module)) {
+      if (failed(replaceFuncArgsWithCompileArgs(func, compileArgTracker,
+                                                 typeConverter, builder))) {
+        signalPassFailure();
+        return;
+      }
+    }
+    // Note: We don't remove arguments here. Memref args are still used by
+    // reinterpret_cast ops. They will be removed after conversion when all
+    // uses are eliminated.
+
+    // Insert a single ttkernel.mm_init for compute kernels after all compile
+    // parameters are materialized and before linalg.batch_matmul lowering.
+    PassManager mmInitPm(context);
+    mmInitPm.addPass(createInsertMMInitPass());
+    if (failed(mmInitPm.run(module))) {
+      signalPassFailure();
+      return;
+    }
+
+
+    // Set up conversion target
+    ConversionTarget target(*context);
+    
+    // Mark loom semaphore/copy ops as illegal in the main lowering stage.
+    // loom.alloc is cleaned up in a dedicated follow-up conversion pass once
+    // semaphore/copy rewrites have consumed it.
+    target.addIllegalOp<::loom::SemaphoreTakeOp>();
+    target.addIllegalOp<::loom::SemaphoreGiveOp>();
+    target.addIllegalOp<::loom::CopyOp>();
+    target.addIllegalOp<::loom::GatherOp>();
+    target.addIllegalOp<::loom::ReduceSumOp>();
+    
+    // Mark memref operations that don't need conversion as legal
+    // (they will be type-converted automatically)
+    target.addLegalDialect<arith::ArithDialect, scf::SCFDialect>();
+    // Normalize unsigned index div/mod before handing IR to EmitC lowering.
+    target.addDynamicallyLegalOp<arith::DivUIOp>(
+        [](arith::DivUIOp op) { return !op.getType().isIndex(); });
+    target.addDynamicallyLegalOp<arith::RemUIOp>(
+        [](arith::RemUIOp op) { return !op.getType().isIndex(); });
+    target.addDynamicallyLegalOp<arith::CeilDivUIOp>(
+        [](arith::CeilDivUIOp op) { return !op.getType().isIndex(); });
+    target.addDynamicallyLegalOp<arith::CeilDivSIOp>(
+        [](arith::CeilDivSIOp op) { return !op.getType().isIndex(); });
+
+    // SCF dialect is generally legal, but we require a conversion for
+    // scf.parallel so it can be lowered to straight-line code with
+    // compile-time iterators.
+    target.addDynamicallyLegalOp<scf::ParallelOp>(
+        [&](scf::ParallelOp op) {
+          // Always mark scf.parallel as illegal so our conversion runs.
+          // If a loop is not rewritten, the conversion will fail.
+          (void)op;
+          return false;
+        });
+
+    // linalg dialect is generally legal, but we require conversion for
+    // matmul-style ops so they can be lowered to TTKernel matmul blocks.
+    target.addLegalDialect<linalg::LinalgDialect>();
+    target.addDynamicallyLegalOp<linalg::MatmulOp>(
+        [&](linalg::MatmulOp op) { return false; });
+    target.addDynamicallyLegalOp<linalg::BatchMatmulOp>(
+        [&](linalg::BatchMatmulOp op) { return false; });
+    target.addDynamicallyLegalOp<::loom::MatmulOp>(
+        [&](::loom::MatmulOp op) { return false; });
+    target.addDynamicallyLegalOp<::loom::BatchMatmulOp>(
+        [&](::loom::BatchMatmulOp op) { return false; });
+    target.addDynamicallyLegalOp<linalg::FillOp>(
+        [&](linalg::FillOp op) { return false; });
+    target.addDynamicallyLegalOp<linalg::GenericOp>(
+        [&](linalg::GenericOp op) {
+          return !mlir::loom::isSupportedFlashAttentionGeneric(op);
+        });
+    target.addDynamicallyLegalOp<linalg::CopyOp>(
+        [&](linalg::CopyOp op) {
+          return !mlir::loom::shouldConvertComputeLinalgCopy(op);
+        });
+    target.addDynamicallyLegalOp<linalg::TransposeOp>(
+        [&](linalg::TransposeOp op) {
+          return !mlir::loom::shouldConvertComputeLinalgTranspose(op);
+        });
+    target.addDynamicallyLegalOp<::loom::BroadcastOp>(
+        [&](::loom::BroadcastOp op) {
+          return !mlir::loom::isComputeKernel(op.getOperation());
+        });
+    target.addDynamicallyLegalOp<::loom::CopyOp>(
+        [&](::loom::CopyOp op) {
+          return false;
+        });
+    
+    // Mark module and function ops as legal (they will be type-converted)
+    target.addLegalOp<ModuleOp>();
+    
+    // Function ops need special handling for signature conversion
+    target.addDynamicallyLegalOp<func::FuncOp>([&](func::FuncOp op) {
+      // Check if function signature needs conversion
+      return typeConverter.isSignatureLegal(op.getFunctionType()) &&
+             typeConverter.isLegal(&op.getBody());
+    });
+    
+    // Mark memref.reinterpret_cast as illegal (consumed by conversion patterns)
+    target.addDynamicallyLegalOp<memref::ReinterpretCastOp>(
+        [&](memref::ReinterpretCastOp op) {
+          return false;
+        });
+    target.addDynamicallyLegalOp<memref::CollapseShapeOp>(
+        [&](memref::CollapseShapeOp op) {
+          auto srcTy = dyn_cast<MemRefType>(op.getSrcType());
+          auto dstTy = dyn_cast<MemRefType>(op.getResultType());
+          if (!srcTy || !dstTy || !srcTy.hasStaticShape() ||
+              !dstTy.hasStaticShape())
+            return true;
+          return srcTy.getNumElements() != dstTy.getNumElements();
+        });
+    target.addDynamicallyLegalOp<memref::ExpandShapeOp>(
+        [&](memref::ExpandShapeOp op) {
+          (void)op;
+          return false;
+        });
+    target.addLegalDialect<mlir::tt::ttkernel::TTKernelDialect,
+                           mlir::emitc::EmitCDialect>();
+    // Allow temporary type-bridge casts introduced during conversion (e.g.,
+    // loom.broadcast logical-result CB view). These are cleaned up later when
+    // they become dead.
+    target.addLegalOp<UnrealizedConversionCastOp>();
+
+    // Populate conversion patterns
+    RewritePatternSet patterns(context);
+
+    // Ensure function signatures, calls, and returns are rewritten when types
+    // (e.g., index -> i32) change.
+    populateFunctionOpInterfaceTypeConversionPattern<func::FuncOp>(
+        patterns, typeConverter);
+    populateReturnOpTypeConversionPattern(patterns, typeConverter);
+    populateCallOpTypeConversionPattern(patterns, typeConverter);
+
+    
+    // Add SCF operation conversion patterns (e.g., scf.parallel -> CT args)
+    populateSCFOpConversionPatterns(patterns, typeConverter, context,
+                                    compileArgTracker);
+
+    // Add memory operation conversion patterns (loom.alloc / loom.copy)
+    populateMemoryOpConversionPatterns(patterns, typeConverter, context,
+                                       compileArgTracker, *reduceProtocol);
+    // Add compute operation conversion patterns (e.g., linalg.matmul)
+    populateComputeOpConversionPatterns(patterns, typeConverter, context,
+                                        compileArgTracker);
+
+    // Apply conversion
+    if (failed(applyPartialConversion(module, target, std::move(patterns)))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Host specialization can leave loop shells containing only unused
+    // get_arg_val/index_cast artifacts. Remove them before final cleanup.
+    eraseHostLoweringArtifacts(module);
+    eraseDeadRuntimeSetupArtifacts(module);
+
+    // Finalize loom.alloc cleanup after all dependent rewrites have run.
+    ConversionTarget allocCleanupTarget(*context);
+    allocCleanupTarget.markUnknownOpDynamicallyLegal(
+        [](Operation *) { return true; });
+    allocCleanupTarget.addIllegalOp<::loom::AllocOp>();
+
+    RewritePatternSet allocCleanupPatterns(context);
+    populateLoomAllocCleanupPatterns(allocCleanupPatterns, typeConverter,
+                                     context);
+
+    if (failed(applyPartialConversion(module, allocCleanupTarget,
+                                      std::move(allocCleanupPatterns)))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Mapping metadata on loop shells is no longer needed after lowering and
+    // leaks unregistered Loom attrs into TT-facing pipelines.
+    eraseLoomLoopAttrs(module);
+
+    // Post-conversion: Remove all function arguments.
+    // After conversion, memref args used in reinterpret_cast should be dead
+    // (the conversion patterns emit GetArgValOp for base addresses).
+    // Index args were already replaced before conversion.
+    for (func::FuncOp func : collectAllFuncOps(module)) {
+      if (failed(removeAllFunctionArguments(func))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // A second runtime-setup DCE pass after function-argument erasure catches
+    // any setup ops that become dead only after signature cleanup.
+    eraseDeadRuntimeSetupArtifacts(module);
+
+
+    // postprocessing optimizations
+    PassManager postPm(context);
+    postPm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
+    postPm.addNestedPass<func::FuncOp>(createCSEPass());
+    postPm.addPass(createSymbolDCEPass());
+    if (failed(postPm.run(module))) {
+      signalPassFailure();
+      return;
+    }
+
+    // Final stage: strip descriptor dialect ops (df/adl) from the module.
+    eraseDescriptorDialectOps(module);
+
+    clearSwapDataMovementNocAttrs();
+  }
+};
+
+/**
+ * @brief Post-EmitC host signature rewrite pass.
+ *
+ * @details Rewrites each generated host helper signature to:
+ *          - `__host_cpp`: one `std::vector<bfloat16>&` per original memref
+ *            argument
+ *          - `__host_pybind`: one `const ttnn::Tensor&` per original memref
+ *            argument
+ *          - `__host_pybind`: one `const std::vector<float>&` per scalar
+ *            runtime source table
+ *          - `__host_cpp` then receives core-range args
+ *          - `__host_pybind` hardcodes its full MLIR core range
+ *          - only `__host_cpp` receives a trailing `IDevice*`
+ *
+ * The number of memref-backed host arguments is read from the
+ * `loom.host_memref_count` attribute emitted during host construction; scalar
+ * host-table arguments are counted by `loom.host_scalar_count`.
+ */
+class PostEmitCHostSignaturePass
+    : public PassWrapper<PostEmitCHostSignaturePass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PostEmitCHostSignaturePass)
+
+  StringRef getArgument() const override {
+    return "loom-post-emitc-host-signature";
+  }
+
+  StringRef getDescription() const override {
+    return "Rewrite host_cpp/host_pybind signatures to typed host inputs and core range args, with IDevice* only on host_cpp";
+  }
+
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<func::FuncDialect, emitc::EmitCDialect>();
+  }
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    MLIRContext *ctx = &getContext();
+
+    Type hostVectorType =
+        emitc::OpaqueType::get(ctx, "std::vector<bfloat16>&");
+    Type hostTensorType =
+        emitc::OpaqueType::get(ctx, "const ttnn::Tensor&");
+    Type hostScalarVectorType =
+        emitc::OpaqueType::get(ctx, "const std::vector<float>&");
+    Type coreCoordType = emitc::OpaqueType::get(ctx, "uint32_t");
+
+    rewriteNamedCBCompileTimeArgLiterals(module);
+
+    for (func::FuncOp func : collectAllFuncOps(module)) {
+      bool isHostCpp =
+          func.getName().ends_with("__host_cpp") ||
+          func.getName().ends_with("__host");
+      bool isHostPybind = func.getName().ends_with("__host_pybind");
+      if (!isHostCpp && !isHostPybind)
+        continue;
+
+      auto countAttr =
+          func->getAttrOfType<IntegerAttr>("loom.host_memref_count");
+      if (!countAttr) {
+        func.emitError()
+            << "missing required attribute 'loom.host_memref_count'";
+        signalPassFailure();
+        return;
+      }
+
+      int64_t hostMemrefCount = countAttr.getInt();
+      if (hostMemrefCount < 0) {
+        func.emitError() << "invalid negative 'loom.host_memref_count': "
+                         << hostMemrefCount;
+        signalPassFailure();
+        return;
+      }
+
+      int64_t hostScalarCount = 0;
+      if (auto scalarCountAttr =
+              func->getAttrOfType<IntegerAttr>("loom.host_scalar_count"))
+        hostScalarCount = scalarCountAttr.getInt();
+      if (hostScalarCount < 0) {
+        func.emitError() << "invalid negative 'loom.host_scalar_count': "
+                         << hostScalarCount;
+        signalPassFailure();
+        return;
+      }
+      ArrayAttr hostArgKinds =
+          func->getAttrOfType<ArrayAttr>("loom.host_arg_kinds");
+
+      Block &entry = func.front();
+      for (BlockArgument arg : entry.getArguments()) {
+        if (!arg.use_empty()) {
+          func.emitError()
+              << "cannot rewrite host signature; argument "
+              << arg.getArgNumber() << " still has uses";
+          signalPassFailure();
+          return;
+        }
+      }
+
+      for (int64_t idx = static_cast<int64_t>(entry.getNumArguments()) - 1;
+           idx >= 0; --idx) {
+        entry.eraseArgument(static_cast<unsigned>(idx));
+      }
+
+      SmallVector<Type> newInputs;
+      if (hostArgKinds) {
+        int64_t seenMemrefs = 0;
+        int64_t seenScalars = 0;
+        for (Attribute attr : hostArgKinds) {
+          auto kindAttr = dyn_cast<StringAttr>(attr);
+          if (!kindAttr) {
+            func.emitError()
+                << "invalid non-string entry in 'loom.host_arg_kinds'";
+            signalPassFailure();
+            return;
+          }
+          if (kindAttr.getValue() == "memref") {
+            newInputs.push_back(isHostPybind ? hostTensorType : hostVectorType);
+            ++seenMemrefs;
+            continue;
+          }
+          if (kindAttr.getValue() == "scalar") {
+            newInputs.push_back(isHostPybind ? hostScalarVectorType
+                                             : hostVectorType);
+            ++seenScalars;
+            continue;
+          }
+          func.emitError() << "unknown host arg kind: " << kindAttr.getValue();
+          signalPassFailure();
+          return;
+        }
+        if (seenMemrefs != hostMemrefCount || seenScalars != hostScalarCount) {
+          func.emitError()
+              << "host arg kind counts do not match host metadata";
+          signalPassFailure();
+          return;
+        }
+      } else {
+        for (int64_t i = 0; i < hostMemrefCount; ++i)
+          newInputs.push_back(isHostPybind ? hostTensorType : hostVectorType);
+        if (isHostPybind) {
+          for (int64_t i = 0; i < hostScalarCount; ++i)
+            newInputs.push_back(hostScalarVectorType);
+        }
+      }
+      if (!isHostPybind) {
+        newInputs.push_back(coreCoordType); // start_core_x
+        newInputs.push_back(coreCoordType); // start_core_y
+        newInputs.push_back(coreCoordType); // end_core_x
+        newInputs.push_back(coreCoordType); // end_core_y
+      }
+      if (!isHostPybind)
+        newInputs.push_back(
+            emitc::PointerType::get(emitc::OpaqueType::get(ctx, "IDevice")));
+
+      for (Type inputType : newInputs)
+        entry.addArgument(inputType, func.getLoc());
+
+      auto funcType = func.getFunctionType();
+      func.setType(
+          FunctionType::get(ctx, newInputs, funcType.getResults()));
+      }
+    }
+};
+
+} // namespace
+
+std::unique_ptr<Pass> mlir::loom::createTileLoomToTTKernelPass() {
+  return std::make_unique<TileLoomToTTKernelPass>();
+}
+
+std::unique_ptr<Pass> mlir::loom::createInsertMMInitPass() {
+  return std::make_unique<InsertMMInitPass>();
+}
+
+void mlir::loom::registerTileLoomToTTKernelPass() {
+  PassRegistration<InsertMMInitPass>();
+  PassRegistration<TileLoomToTTKernelPass>();
+  PassRegistration<PostEmitCHostSignaturePass>();
+}
