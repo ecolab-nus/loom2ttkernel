@@ -1933,11 +1933,50 @@ findUniqueOutputStoreForBuffer(func::FuncOp func, Value buffer,
   return matches.front();
 }
 
+struct MatmulMergeOperands {
+  Operation *op;
+  Value lhs;
+  Value rhs;
+  Value out;
+};
+
+static std::optional<MatmulMergeOperands>
+getMatmulMergeOperands(Operation *op) {
+  if (auto matmulOp = dyn_cast<linalg::MatmulOp>(op)) {
+    if (matmulOp.getInputs().size() != 2 || matmulOp.getOutputs().size() != 1)
+      return std::nullopt;
+    return MatmulMergeOperands{op, matmulOp.getInputs()[0],
+                               matmulOp.getInputs()[1],
+                               matmulOp.getOutputs()[0]};
+  }
+
+  if (auto matmulOp = dyn_cast<linalg::BatchMatmulOp>(op)) {
+    if (matmulOp.getInputs().size() != 2 || matmulOp.getOutputs().size() != 1)
+      return std::nullopt;
+    return MatmulMergeOperands{op, matmulOp.getInputs()[0],
+                               matmulOp.getInputs()[1],
+                               matmulOp.getOutputs()[0]};
+  }
+
+  if (auto matmulOp = dyn_cast<::loom::MatmulOp>(op))
+    return MatmulMergeOperands{op, matmulOp.getLhs(), matmulOp.getRhs(),
+                               matmulOp.getOuts()};
+
+  if (auto matmulOp = dyn_cast<::loom::BatchMatmulOp>(op))
+    return MatmulMergeOperands{op, matmulOp.getLhs(), matmulOp.getRhs(),
+                               matmulOp.getOuts()};
+
+  return std::nullopt;
+}
+
 static LogicalResult annotateMatmulBReaderMerge(func::FuncOp func) {
-  SmallVector<linalg::MatmulOp, 2> matmuls;
+  SmallVector<MatmulMergeOperands, 2> matmuls;
   int loadCopyCount = 0;
   int storeCopyCount = 0;
-  func.walk([&](linalg::MatmulOp matmulOp) { matmuls.push_back(matmulOp); });
+  func.walk([&](Operation *op) {
+    if (auto operands = getMatmulMergeOperands(op))
+      matmuls.push_back(*operands);
+  });
   func.walk([&](::loom::CopyOp copyOp) {
     if (isLoomLoadOp(copyOp))
       ++loadCopyCount;
@@ -1950,12 +1989,12 @@ static LogicalResult annotateMatmulBReaderMerge(func::FuncOp func) {
 
   if (matmuls.size() != 1) {
     return func.emitError()
-           << "matmul B-reader merge expects exactly one linalg.matmul";
+           << "matmul B-reader merge expects exactly one matmul-like op";
   }
 
-  linalg::MatmulOp matmulOp = matmuls.front();
-  if (matmulOp.getInputs().size() != 2 || matmulOp.getOutputs().size() != 1) {
-    return matmulOp.emitOpError()
+  MatmulMergeOperands matmulOp = matmuls.front();
+  if (!matmulOp.lhs || !matmulOp.rhs || !matmulOp.out) {
+    return matmulOp.op->emitOpError()
            << "matmul B-reader merge expects two inputs and one output";
   }
   if (loadCopyCount != 2 || storeCopyCount != 1) {
@@ -1965,20 +2004,19 @@ static LogicalResult annotateMatmulBReaderMerge(func::FuncOp func) {
   }
 
   FailureOr<::loom::CopyOp> lhsLoad =
-      findUniqueCopyForBuffer(func, matmulOp.getInputs()[0], /*wantLoad=*/true,
+      findUniqueCopyForBuffer(func, matmulOp.lhs, /*wantLoad=*/true,
                               "matmul lhs");
   if (failed(lhsLoad))
     return failure();
 
   FailureOr<::loom::CopyOp> rhsLoad =
-      findUniqueCopyForBuffer(func, matmulOp.getInputs()[1], /*wantLoad=*/true,
+      findUniqueCopyForBuffer(func, matmulOp.rhs, /*wantLoad=*/true,
                               "matmul rhs");
   if (failed(rhsLoad))
     return failure();
 
   FailureOr<::loom::CopyOp> outputStore =
-      findUniqueOutputStoreForBuffer(func, matmulOp.getOutputs()[0],
-                                     "matmul output");
+      findUniqueOutputStoreForBuffer(func, matmulOp.out, "matmul output");
   if (failed(outputStore))
     return failure();
 

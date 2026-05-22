@@ -34,6 +34,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -1051,29 +1052,29 @@ chooseMatmulSubblock(int64_t rt, int64_t ct, int64_t capacity) {
   if (rt <= 0 || ct <= 0 || capacity <= 0)
     return std::nullopt;
 
-  MatmulSubblockInfo best;
-  int64_t bestArea = 0;
-  int64_t bestImbalance = capacity;
-  auto imbalance = [](int64_t lhs, int64_t rhs) {
-    return lhs > rhs ? lhs - rhs : rhs - lhs;
-  };
+  static constexpr std::array<std::tuple<int64_t, int64_t>, 20>
+      subblockHWChoices = {{
+          {4, 2}, {2, 4}, {8, 1}, {1, 8}, // subblock_hw = 8
+          {7, 1}, {1, 7},                 // subblock_hw = 7
+          {3, 2}, {2, 3}, {6, 1}, {1, 6}, // subblock_hw = 6
+          {5, 1}, {1, 5},                 // subblock_hw = 5
+          {2, 2}, {4, 1}, {1, 4},         // subblock_hw = 4
+          {3, 1}, {1, 3},                 // subblock_hw = 3
+          {2, 1}, {1, 2},                 // subblock_hw = 2
+          {1, 1},                         // subblock_hw = 1
+      }};
 
-  for (int64_t r = 1; r <= std::min(rt, capacity); ++r) {
-    for (int64_t c = 1; c <= std::min(ct, capacity / r); ++c) {
-      int64_t area = r * c;
-      int64_t shapeImbalance = imbalance(r, c);
-      if (area > bestArea ||
-          (area == bestArea && shapeImbalance < bestImbalance)) {
-        best = {r, c};
-        bestArea = area;
-        bestImbalance = shapeImbalance;
-      }
-    }
+  for (auto subblockHW : subblockHWChoices) {
+    int64_t outSubblockW = std::get<0>(subblockHW);
+    int64_t outSubblockH = std::get<1>(subblockHW);
+    int64_t area = outSubblockH * outSubblockW;
+    if (area > capacity)
+      continue;
+    if (rt % outSubblockH == 0 && ct % outSubblockW == 0)
+      return MatmulSubblockInfo{outSubblockH, outSubblockW};
   }
 
-  if (bestArea == 0)
-    return std::nullopt;
-  return best;
+  return std::nullopt;
 }
 
 /**
