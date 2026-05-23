@@ -15,6 +15,8 @@ inline constexpr llvm::StringLiteral kPartitionStrategyAttrName =
     "loom.ttkernel.partition_strategy";
 inline constexpr llvm::StringLiteral kSwapDataMovementNocsAttrName =
     "loom.ttkernel.swap_data_movement_nocs";
+inline constexpr llvm::StringLiteral kSplitHalfDataMovementCoresAttrName =
+    "loom.ttkernel.split_half_dm_cores";
 inline constexpr llvm::StringLiteral kCopyDataMovementRoleAttrName =
     "loom.ttkernel.dm_role";
 inline constexpr llvm::StringLiteral kDMProcessorAttrName =

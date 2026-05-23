@@ -1271,8 +1271,6 @@ LogicalResult mlir::loom::CompileArgTracker::processInputArgs(
     Value mcastSenderSemaphoreNocAddrOp;
     Value mcastReceiverSemaphoreNocAddrOp;
     if (!isComputeKernel && baseAddrOp) {
-      Value nocIdVal = rewriter.create<arith::ConstantIntOp>(
-          bindingLoc, rewriter.getI8Type(), resolvedDmNocId);
       Value pageSize = GetTileSizeOp::create(rewriter, bindingLoc, cbOp);
       Value tensorAccessorArgsIdxVal = rewriter.create<arith::ConstantIntOp>(
           bindingLoc, rewriter.getI32Type(), accessorIndexIt->second);
@@ -1303,7 +1301,7 @@ LogicalResult mlir::loom::CompileArgTracker::processInputArgs(
             rewriter
                 .create<ExperimentalGetNocMulticastAddrOp>(
                     bindingLoc, mcastDestStartX, mcastDestStartY, mcastDestEndX,
-                    mcastDestEndY, mcastReceiverSemaphoreAddrOp, nocIdVal)
+                    mcastDestEndY, mcastReceiverSemaphoreAddrOp, Value())
                 .getResult();
       }
     }
@@ -3613,6 +3611,19 @@ private:
                ";");
     }
     emitLine("CoreRangeSet all_cores{ CoreRange{ {start_core_x, start_core_y}, {end_core_x, end_core_y} } };");
+    if (useSplitHalfDataMovementCores()) {
+      emitLine("uint32_t num_cores_c = end_core_x - start_core_x + 1;");
+      emitLine("uint32_t num_cores_r = end_core_y - start_core_y + 1;");
+      emitLine("(void)num_cores_r;");
+      emitLine("uint32_t half_core = num_cores_c / 2;");
+      emitLine("uint32_t split_start_x = start_core_x + half_core + 1;");
+      emitLine("uint32_t split_start_y = start_core_y + 1;");
+      emitLine("CoreRangeSet default_dm_cores = CoreRangeSet(std::vector{");
+      emitLine("CoreRange{ {start_core_x, start_core_y}, {start_core_x + half_core, end_core_y} },");
+      emitLine("CoreRange{ {split_start_x, start_core_y}, {end_core_x, start_core_y} }");
+      emitLine("});");
+      emitLine("CoreRangeSet split_dm_cores{ CoreRange{ {split_start_x, split_start_y}, {end_core_x, end_core_y} } };");
+    }
     emitLine("constexpr uint32_t single_tile_size = sizeof(bfloat16) * TILE_HEIGHT * TILE_WIDTH;");
     emitLine("const auto cb_data_format = tt::DataFormat::Float16_b;");
     emitLine("uint32_t cb_buffer_depth = 2;");
@@ -3810,6 +3821,10 @@ private:
                         });
   }
 
+  bool useSplitHalfDataMovementCores() const {
+    return originalFunc->hasAttr(kSplitHalfDataMovementCoresAttrName);
+  }
+
   const RuntimeArgLayout &runtimeLayoutForRole(KernelRuntimeRole role) const {
     switch (role) {
     case KernelRuntimeRole::Reader:
@@ -3977,13 +3992,56 @@ private:
              std::to_string(*index) + "] = " + valueExpr + ";");
   }
 
+  void emitPybindRuntimePatches(bool patchReader, bool patchWriter,
+                                bool patchCompute) {
+    auto patchIfSelected = [&](KernelRuntimeRole role, RuntimeArgKey key,
+                               const std::string &valueExpr) {
+      if ((role == KernelRuntimeRole::Reader && patchReader) ||
+          (role == KernelRuntimeRole::Writer && patchWriter) ||
+          (role == KernelRuntimeRole::Compute && patchCompute))
+        emitRuntimePatchIfPresent(role, key, valueExpr);
+    };
+
+    for (const CopyBindingInfo &binding : copyBindings) {
+      const DramBufferInfo &dramInfo = dramInfos[binding.dramInfoIndex];
+      RuntimeArgKey baseKey = RuntimeArgKey::copyBinding(
+          binding.slot, CopyBindingRuntimeField::BaseAddr);
+      std::string addressExpr = dramInfo.bufferName + "->address()";
+      patchIfSelected(KernelRuntimeRole::Reader, baseKey, addressExpr);
+      patchIfSelected(KernelRuntimeRole::Writer, baseKey, addressExpr);
+      patchIfSelected(KernelRuntimeRole::Compute, baseKey, addressExpr);
+    }
+
+    for (const ScalarRuntimeSiteInfo &site : scalarRuntimeSites) {
+      for (auto [elementIndex, offsetExpr] : llvm::enumerate(site.offsetExprs)) {
+        std::string sitePrefix =
+            getScalarRuntimePrefix(site, static_cast<int64_t>(elementIndex));
+        emitScalarRuntimeIndex(sitePrefix, offsetExpr);
+        emitScalarRuntimePybindLoad(site, sitePrefix);
+        RuntimeArgKey scalarKey = RuntimeArgKey::scalarSite(
+            site.siteId, static_cast<int64_t>(elementIndex));
+        std::string packedExpr =
+            getScalarRuntimePackedName(site, static_cast<int64_t>(elementIndex));
+        patchIfSelected(KernelRuntimeRole::Reader, scalarKey, packedExpr);
+        patchIfSelected(KernelRuntimeRole::Writer, scalarKey, packedExpr);
+        patchIfSelected(KernelRuntimeRole::Compute, scalarKey, packedExpr);
+      }
+    }
+  }
+
   void emitPybindOverrideRuntimeCallback() {
     if (kind != HostProgramKind::Pybind)
       return;
 
-    std::string captures =
-        "reader_id, writer_id, compute_kernel_id, start_core_x, start_core_y, "
-        "end_core_x, end_core_y";
+    const bool splitHalfDmCores = useSplitHalfDataMovementCores();
+    std::string captures = "reader_id, writer_id, compute_kernel_id";
+    if (splitHalfDmCores) {
+      captures +=
+          ", reader_split_id, writer_split_id, default_dm_cores, split_dm_cores, all_cores";
+    } else {
+      captures +=
+          ", start_core_x, start_core_y, end_core_x, end_core_y";
+    }
     for (const ScalarRuntimeHostArgInfo &info : scalarRuntimeHostArgs)
       captures += ", " + info.valuesName;
 
@@ -4007,6 +4065,34 @@ private:
     emitLine("auto& writer_args_by_core = GetRuntimeArgs(program, writer_id);");
     emitLine(
         "auto& compute_args_by_core = GetRuntimeArgs(program, compute_kernel_id);");
+    if (splitHalfDmCores) {
+      emitLine("auto& reader_split_args_by_core = GetRuntimeArgs(program, reader_split_id);");
+      emitLine("auto& writer_split_args_by_core = GetRuntimeArgs(program, writer_split_id);");
+      emitLine("constexpr bool row_major = true;");
+      emitLine("auto default_dm_core_list = corerange_to_cores(default_dm_cores, std::nullopt, row_major);");
+      emitLine("for (const auto& core : default_dm_core_list) {");
+      emitLine("auto& reader_args = reader_args_by_core[core.x][core.y];");
+      emitLine("auto& writer_args = writer_args_by_core[core.x][core.y];");
+      emitPybindRuntimePatches(/*patchReader=*/true, /*patchWriter=*/true,
+                                /*patchCompute=*/false);
+      emitLine("}");
+      emitLine("auto split_dm_core_list = corerange_to_cores(split_dm_cores, std::nullopt, row_major);");
+      emitLine("for (const auto& core : split_dm_core_list) {");
+      emitLine("auto& reader_args = reader_split_args_by_core[core.x][core.y];");
+      emitLine("auto& writer_args = writer_split_args_by_core[core.x][core.y];");
+      emitPybindRuntimePatches(/*patchReader=*/true, /*patchWriter=*/true,
+                                /*patchCompute=*/false);
+      emitLine("}");
+      emitLine("auto compute_core_list = corerange_to_cores(all_cores, std::nullopt, row_major);");
+      emitLine("for (const auto& core : compute_core_list) {");
+      emitLine("auto& compute_args = compute_args_by_core[core.x][core.y];");
+      emitPybindRuntimePatches(/*patchReader=*/false, /*patchWriter=*/false,
+                                /*patchCompute=*/true);
+      emitLine("}");
+      emitLine("};");
+      return;
+    }
+
     emitLine("for (uint32_t core_x = start_core_x; core_x <= end_core_x; ++core_x) {");
     emitLine("for (uint32_t core_y = start_core_y; core_y <= end_core_y; ++core_y) {");
     emitLine("auto& reader_args = reader_args_by_core[core_x][core_y];");
@@ -4014,38 +4100,8 @@ private:
     emitLine("auto& compute_args = compute_args_by_core[core_x][core_y];");
     if (scalarRuntimeOffsetsUseCore())
       emitLine("CoreCoord core{core_x, core_y};");
-
-    for (const CopyBindingInfo &binding : copyBindings) {
-      const DramBufferInfo &dramInfo = dramInfos[binding.dramInfoIndex];
-      RuntimeArgKey baseKey = RuntimeArgKey::copyBinding(
-          binding.slot, CopyBindingRuntimeField::BaseAddr);
-      std::string addressExpr = dramInfo.bufferName + "->address()";
-      emitRuntimePatchIfPresent(KernelRuntimeRole::Reader, baseKey,
-                                addressExpr);
-      emitRuntimePatchIfPresent(KernelRuntimeRole::Writer, baseKey,
-                                addressExpr);
-      emitRuntimePatchIfPresent(KernelRuntimeRole::Compute, baseKey,
-                                addressExpr);
-    }
-
-    for (const ScalarRuntimeSiteInfo &site : scalarRuntimeSites) {
-      for (auto [elementIndex, offsetExpr] : llvm::enumerate(site.offsetExprs)) {
-        std::string sitePrefix =
-            getScalarRuntimePrefix(site, static_cast<int64_t>(elementIndex));
-        emitScalarRuntimeIndex(sitePrefix, offsetExpr);
-        emitScalarRuntimePybindLoad(site, sitePrefix);
-        RuntimeArgKey scalarKey = RuntimeArgKey::scalarSite(
-            site.siteId, static_cast<int64_t>(elementIndex));
-        std::string packedExpr =
-            getScalarRuntimePackedName(site, static_cast<int64_t>(elementIndex));
-        emitRuntimePatchIfPresent(KernelRuntimeRole::Reader, scalarKey,
-                                  packedExpr);
-        emitRuntimePatchIfPresent(KernelRuntimeRole::Writer, scalarKey,
-                                  packedExpr);
-        emitRuntimePatchIfPresent(KernelRuntimeRole::Compute, scalarKey,
-                                  packedExpr);
-      }
-    }
+    emitPybindRuntimePatches(/*patchReader=*/true, /*patchWriter=*/true,
+                              /*patchCompute=*/true);
 
     emitLine("}");
     emitLine("}");
@@ -4089,13 +4145,37 @@ private:
 
   void emitCoreMulticastMappingAtEnd() {
     emitLine("constexpr bool row_major = true;");
+    if (useSplitHalfDataMovementCores()) {
+      emitLine("auto cores = corerange_to_cores(default_dm_cores, std::nullopt, row_major);");
+      emitLine("for (const auto& core : cores) {");
+      emitRuntimeArgsForCore("reader_id", "writer_id",
+                             /*emitDataMovement=*/true,
+                             /*emitCompute=*/false);
+      emitLine("}");
+      emitLine("auto split_cores = corerange_to_cores(split_dm_cores, std::nullopt, row_major);");
+      emitLine("for (const auto& core : split_cores) {");
+      emitRuntimeArgsForCore("reader_split_id", "writer_split_id",
+                             /*emitDataMovement=*/true,
+                             /*emitCompute=*/false);
+      emitLine("}");
+      emitLine("auto compute_cores = corerange_to_cores(all_cores, std::nullopt, row_major);");
+      emitLine("for (const auto& core : compute_cores) {");
+      emitRuntimeArgsForCore("", "", /*emitDataMovement=*/false,
+                             /*emitCompute=*/true);
+      emitLine("}");
+      return;
+    }
+
     emitLine("auto cores = corerange_to_cores(all_cores, std::nullopt, row_major);");
     emitLine("for (const auto& core : cores) {");
-    emitReaderRuntimeArgsForCore();
+    emitRuntimeArgsForCore("reader_id", "writer_id",
+                           /*emitDataMovement=*/true,
+                           /*emitCompute=*/true);
     emitLine("}");
   }
 
-  void emitReaderRuntimeArgsForCore() {
+  void emitRuntimeArgsForCore(StringRef readerKernelId, StringRef writerKernelId,
+                              bool emitDataMovement, bool emitCompute) {
     for (const CopyBindingInfo &binding : copyBindings) {
       if (!binding.isInput || !binding.hasBroadcastRegion)
         continue;
@@ -4194,16 +4274,19 @@ private:
       }
     }
 
-    emitRuntimeArgVector(KernelRuntimeRole::Reader);
-    emitRuntimeArgVector(KernelRuntimeRole::Writer);
-    emitRuntimeArgVector(KernelRuntimeRole::Compute);
-
-    emitLine("tt_metal::SetRuntimeArgs(program, reader_id, core, "
-             "reader_runtime_args_for_core);");
-    emitLine("tt_metal::SetRuntimeArgs(program, writer_id, core, "
-             "writer_runtime_args_for_core);");
-    emitLine("tt_metal::SetRuntimeArgs(program, compute_kernel_id, core, "
-             "compute_runtime_args_for_core);");
+    if (emitDataMovement) {
+      emitRuntimeArgVector(KernelRuntimeRole::Reader);
+      emitRuntimeArgVector(KernelRuntimeRole::Writer);
+      emitLine("tt_metal::SetRuntimeArgs(program, " + readerKernelId.str() +
+               ", core, reader_runtime_args_for_core);");
+      emitLine("tt_metal::SetRuntimeArgs(program, " + writerKernelId.str() +
+               ", core, writer_runtime_args_for_core);");
+    }
+    if (emitCompute) {
+      emitRuntimeArgVector(KernelRuntimeRole::Compute);
+      emitLine("tt_metal::SetRuntimeArgs(program, compute_kernel_id, core, "
+               "compute_runtime_args_for_core);");
+    }
   }
 
   void emitCompileArgs() {
@@ -4230,24 +4313,45 @@ private:
     const DataMovementKernelSpec writerSpec =
         getDataMovementKernelSpec(DataMovementKernelRole::Writer,
                                   useSwappedNocs);
-    const SmallVector<KernelRoleInfo, 3> roles = {
-        {"reader_id",
-         "reader.cpp",
-         buildHostDataMovementConfigExpr(readerSpec)},
-        {"writer_id",
-         "writer.cpp",
-         buildHostDataMovementConfigExpr(writerSpec)},
-        {"compute_kernel_id",
-         "compute.cpp",
-         "tt_metal::ComputeConfig{.math_fidelity = math_fidelity, "
-         ".compile_args = compile_args}"}};
-
-    for (const KernelRoleInfo &role : roles) {
+    auto emitKernel = [&](const KernelRoleInfo &role,
+                          StringRef coreRangeSetName) {
       emitLine("auto " + role.idVarName + " = tt_metal::CreateKernel("
                "program, OVERRIDE_KERNEL_PREFIX "
                "\"tt_metal/programming_examples/mlir_matmul_simple/kernels/" +
-               role.kernelSource + "\", all_cores, " + role.configExpr + ");");
+               role.kernelSource + "\", " + coreRangeSetName.str() + ", " +
+               role.configExpr + ");");
+    };
+
+    const bool splitHalfDmCores = useSplitHalfDataMovementCores();
+    StringRef dataMovementCoreRange =
+        splitHalfDmCores ? "default_dm_cores" : "all_cores";
+    emitKernel({"reader_id", "reader.cpp",
+                buildHostDataMovementConfigExpr(readerSpec)},
+               dataMovementCoreRange);
+    emitKernel({"writer_id", "writer.cpp",
+                buildHostDataMovementConfigExpr(writerSpec)},
+               dataMovementCoreRange);
+
+    if (splitHalfDmCores) {
+      const DataMovementKernelSpec readerSplitSpec =
+          getDataMovementKernelSpec(DataMovementKernelRole::Reader,
+                                    !useSwappedNocs);
+      const DataMovementKernelSpec writerSplitSpec =
+          getDataMovementKernelSpec(DataMovementKernelRole::Writer,
+                                    !useSwappedNocs);
+      emitKernel({"reader_split_id", "reader.cpp",
+                  buildHostDataMovementConfigExpr(readerSplitSpec)},
+                 "split_dm_cores");
+      emitKernel({"writer_split_id", "writer.cpp",
+                  buildHostDataMovementConfigExpr(writerSplitSpec)},
+                 "split_dm_cores");
     }
+
+    emitKernel({"compute_kernel_id",
+                "compute.cpp",
+                "tt_metal::ComputeConfig{.math_fidelity = math_fidelity, "
+                ".compile_args = compile_args}"},
+               "all_cores");
   }
 
   func::FuncOp originalFunc;

@@ -628,6 +628,12 @@ public:
                 "For linalg.matmul, keep the A reader on RISCV_1 and merge "
                 "the B reader into the writer kernel on RISCV_0"),
             llvm::cl::init(false)),
+        matmulSplitHalfDataMovementCores(
+            *this, "matmul-split-half-dm-cores",
+            llvm::cl::desc(
+                "For 2D multicast matmul, duplicate receiver data-movement "
+                "kernels on the right-side internal cores with alternate NOCs"),
+            llvm::cl::init(false)),
         reduceProtocolOpt(
             *this, "reduce-protocol",
             llvm::cl::desc("Reduce synchronization protocol "
@@ -646,6 +652,12 @@ public:
                 "For linalg.matmul, keep the A reader on RISCV_1 and merge "
                 "the B reader into the writer kernel on RISCV_0"),
             llvm::cl::init(false)),
+        matmulSplitHalfDataMovementCores(
+            *this, "matmul-split-half-dm-cores",
+            llvm::cl::desc(
+                "For 2D multicast matmul, duplicate receiver data-movement "
+                "kernels on the right-side internal cores with alternate NOCs"),
+            llvm::cl::init(false)),
         reduceProtocolOpt(
             *this, "reduce-protocol",
             llvm::cl::desc("Reduce synchronization protocol "
@@ -657,6 +669,8 @@ public:
             llvm::cl::init("")) {
     matmulMergeBReaderIntoWriter =
         static_cast<bool>(other.matmulMergeBReaderIntoWriter);
+    matmulSplitHalfDataMovementCores =
+        static_cast<bool>(other.matmulSplitHalfDataMovementCores);
     reduceProtocolOpt = other.reduceProtocolOpt;
     reduceProtocolDeprecated = other.reduceProtocolDeprecated;
   }
@@ -684,6 +698,7 @@ public:
   }
 
   Option<bool> matmulMergeBReaderIntoWriter;
+  Option<bool> matmulSplitHalfDataMovementCores;
   Option<std::string> reduceProtocolOpt;
   /// @deprecated Use reduce-protocol instead.
   Option<std::string> reduceProtocolDeprecated;
@@ -698,6 +713,17 @@ public:
       });
     };
     clearSwapDataMovementNocAttrs();
+
+    module.walk([](func::FuncOp func) {
+      func->removeAttr(kSplitHalfDataMovementCoresAttrName);
+    });
+    if (matmulSplitHalfDataMovementCores) {
+      Builder attrBuilder(context);
+      module.walk([&](func::FuncOp func) {
+        func->setAttr(kSplitHalfDataMovementCoresAttrName,
+                      attrBuilder.getUnitAttr());
+      });
+    }
 
     // Preprocessing: hoist invariant allocs and simplify before lowering.
     //

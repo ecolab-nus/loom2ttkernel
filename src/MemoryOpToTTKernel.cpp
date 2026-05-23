@@ -998,16 +998,14 @@ std::pair<Value, Value> dram_read(Value source, Location loc,
 bool multicast_send(ConversionPatternRewriter &rewriter, Location loc, MemrefArgData *memrefArgData, Value totalSizeBytes, Value multicast_l1Addr) {
   Value zero = rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(), 0);
   auto falseAttr = rewriter.getBoolAttr(false);
-  // Create noc_id as a Value
-  Value nocIdVal = rewriter.create<arith::ConstantIntOp>(
-      loc, rewriter.getI8Type(), memrefArgData->noc_id);
+  auto trueAttr = rewriter.getBoolAttr(true);
   Value noc_multicast_addr =
       rewriter.create<ExperimentalGetNocMulticastAddrOp>(
                   loc, memrefArgData->mcast_dest_noc_start_x,
                   memrefArgData->mcast_dest_noc_start_y,
                   memrefArgData->mcast_dest_noc_end_x,
                   memrefArgData->mcast_dest_noc_end_y, multicast_l1Addr,
-                  nocIdVal)
+                  Value())
           .getResult();
 
   //init multicast semaphore
@@ -1020,14 +1018,13 @@ bool multicast_send(ConversionPatternRewriter &rewriter, Location loc, MemrefArg
   // THEN: reset the semaphore to 0 for the next iteration
   NocSemaphoreSetOp::create(rewriter, loc, memrefArgData->mcast_sender_semaphore_addr_ptr, zero);
   // send the data to the destinations
-  // Provide explicit false attrs when supplying noc_id to avoid asm ambiguity.
   NocAsyncWriteMulticastOp::create(
       rewriter, loc, multicast_l1Addr, noc_multicast_addr,
       totalSizeBytes, // total size of last read
       memrefArgData->mcast_dest_num,
-      falseAttr, // linked (optional BoolAttr)
+      trueAttr, // linked (optional BoolAttr)
       falseAttr, // multicast_path_reserve (optional BoolAttr)
-      nocIdVal);
+      Value());
   //only work for blackhole arch
   rewriter.create<emitc::VerbatimOp>(loc, "#ifdef ARCH_BLACKHOLE");
   rewriter.create<emitc::VerbatimOp>(loc, "noc_async_writes_flushed();");
@@ -1037,7 +1034,7 @@ bool multicast_send(ConversionPatternRewriter &rewriter, Location loc, MemrefArg
     memrefArgData->mcast_receiver_semaphore_addr, 
     memrefArgData->mcast_receiver_semaphore_noc_addr,
     memrefArgData->mcast_dest_num,
-    falseAttr,  // linked (optional BoolAttr)
+    trueAttr,  // linked (optional BoolAttr)
     falseAttr); // multicast_path_reserve (optional BoolAttr)
   return true;
 }
@@ -1049,9 +1046,8 @@ bool multicast_receive(ConversionPatternRewriter &rewriter, Location loc,
       rewriter, loc, memrefArgData->mcast_receiver_semaphore_addr_ptr, zero);
       // add it by 1
       Value one = rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(), 1);
-      Value nocIdVal = rewriter.create<arith::ConstantIntOp>(
-        loc, rewriter.getI8Type(), memrefArgData->noc_id);
-      NocSemaphoreIncOp::create(rewriter, loc, memrefArgData->mcast_sender_semaphore_noc_addr, one, nocIdVal);
+      NocSemaphoreIncOp::create(rewriter, loc,
+          memrefArgData->mcast_sender_semaphore_noc_addr, one, Value());
       // wait all data arrived
       NocSemaphoreWaitOp::create(rewriter, loc,
           memrefArgData->mcast_receiver_semaphore_addr_ptr, one);
