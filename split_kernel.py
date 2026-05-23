@@ -666,6 +666,47 @@ def _build_compute_helper_block(usage):
     return block
 
 
+def _split_top_level_args(args_text):
+    args = []
+    current = []
+    depth = 0
+    for char in args_text:
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}>":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+
+    last_arg = "".join(current).strip()
+    if last_arg:
+        args.append(last_arg)
+    return args
+
+
+def _restore_multicast_bool_args(line):
+    multicast_ops = {
+        "noc_async_write_multicast": 4
+    }
+    match = re.match(
+        r"^(\s*)(noc_async_write_multicast)\((.*)\)(\s*;\s*(?://.*)?\n?)$",
+        line,
+    )
+    if not match:
+        return line
+
+    indent, op_name, args_text, suffix = match.groups()
+    args = _split_top_level_args(args_text)
+    expected_args_without_attrs = multicast_ops[op_name]
+    if len(args) != expected_args_without_attrs:
+        return line
+
+    return f"{indent}{op_name}({args_text}, true){suffix}"
+
+
 def process_source_content(lines, section_name=None):
     """
     Process source file content by applying necessary replacements.
@@ -687,6 +728,7 @@ def process_source_content(lines, section_name=None):
         .replace("INFINITY", '__builtin_inff()')
         for line in lines
     ]
+    processed = [_restore_multicast_bool_args(line) for line in processed]
 
     if section_name and section_name.startswith("host_pybind"):
         processed = [
