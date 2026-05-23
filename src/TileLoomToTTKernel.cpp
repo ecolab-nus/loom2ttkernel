@@ -981,7 +981,8 @@ public:
 
     // Add memory operation conversion patterns (loom.alloc / loom.copy)
     populateMemoryOpConversionPatterns(patterns, typeConverter, context,
-                                       compileArgTracker, *reduceProtocol);
+                                       compileArgTracker, *reduceProtocol,
+                                       matmulMergeBReaderIntoWriter);
     // Add compute operation conversion patterns (e.g., linalg.matmul)
     populateComputeOpConversionPatterns(patterns, typeConverter, context,
                                         compileArgTracker);

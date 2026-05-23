@@ -612,7 +612,8 @@ static bool isSemaphoreGiveForGatherInput(::loom::SemaphoreGiveOp giveOp) {
  */
 std::pair<Value, Value> dram_read(Value source, Location loc,
                                    ConversionPatternRewriter &rewriter,
-                                   CopyBindingData *bindingData) {
+                                   CopyBindingData *bindingData,
+                                   bool matmulMergeBReaderIntoWriter) {
   auto reinterpretCastOp = source.getDefiningOp<memref::ReinterpretCastOp>();
   if (!reinterpretCastOp) {
     emitError(loc) << "DRAM read source must be memref.reinterpret_cast";
@@ -885,7 +886,8 @@ std::pair<Value, Value> dram_read(Value source, Location loc,
         (strides.size() > 0) ? strides[strides.size() - 1] : 1);
 
     int64_t totalTiles = numTileRows * numTileCols;
-    bool enableReadBarrier = totalTiles > 16;
+    bool enableReadBarrier =
+        totalTiles > 16 && !matmulMergeBReaderIntoWriter;
     int64_t numCores =
         bindingData->parallelCoreCount > 0 ? bindingData->parallelCoreCount : 1;
     int64_t barrierReadThreshold = 1;
@@ -1354,9 +1356,11 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
   using OpConversionPattern<::loom::CopyOp>::OpConversionPattern;
 
   ConvertLoomMemoryLoadOp(TypeConverter &typeConverter, MLIRContext *context,
-                          std::shared_ptr<CompileArgTracker> tracker)
+                          std::shared_ptr<CompileArgTracker> tracker,
+                          bool matmulMergeBReaderIntoWriter)
       : OpConversionPattern<::loom::CopyOp>(typeConverter, context),
-        tracker(std::move(tracker)) {}
+        tracker(std::move(tracker)),
+        matmulMergeBReaderIntoWriter(matmulMergeBReaderIntoWriter) {}
 
   LogicalResult
   matchAndRewrite(::loom::CopyOp op, OpAdaptor adaptor,
@@ -1494,7 +1498,8 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
         rewriter.setInsertionPoint(
             ifOp.getThenRegion().front().getTerminator());
         auto [totalSizeBytes, multicast_l1Addr] = dram_read(
-            source, loc, rewriter, bindingData);
+            source, loc, rewriter, bindingData,
+            matmulMergeBReaderIntoWriter);
         if (!totalSizeBytes || !multicast_l1Addr)
           return op.emitOpError("failed to emit DRAM read for multicast send");
         multicast_send(rewriter, loc, bindingData, totalSizeBytes,
@@ -1507,7 +1512,8 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
       rewriter.setInsertionPointAfter(ifOp);
     } else {
       auto [totalSizeBytes, multicast_l1Addr] = dram_read(
-          source, loc, rewriter, bindingData);
+          source, loc, rewriter, bindingData,
+          matmulMergeBReaderIntoWriter);
       if (!totalSizeBytes || !multicast_l1Addr)
         return op.emitOpError("failed to emit DRAM read");
     }
@@ -1520,6 +1526,7 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
 
 private:
   std::shared_ptr<CompileArgTracker> tracker;
+  bool matmulMergeBReaderIntoWriter;
 };
 
 /**
@@ -1533,9 +1540,11 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
   using OpConversionPattern<::loom::CopyOp>::OpConversionPattern;
 
   ConvertLoomMemoryStoreOp(TypeConverter &typeConverter, MLIRContext *context,
-                           std::shared_ptr<CompileArgTracker> tracker)
+                           std::shared_ptr<CompileArgTracker> tracker,
+                           bool matmulMergeBReaderIntoWriter)
       : OpConversionPattern<::loom::CopyOp>(typeConverter, context),
-        tracker(std::move(tracker)) {}
+        tracker(std::move(tracker)),
+        matmulMergeBReaderIntoWriter(matmulMergeBReaderIntoWriter) {}
 
   LogicalResult
   matchAndRewrite(::loom::CopyOp op, OpAdaptor adaptor,
@@ -1676,7 +1685,8 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
       loc, rewriter.getI32Type(), (strides.size() > 0) ? strides[strides.size() - 1] : 1);
 
     int64_t totalTiles = numTileRows * numTileCols;
-    bool enableWriteBarrier = totalTiles > 16;
+    bool enableWriteBarrier =
+        totalTiles > 16 && !matmulMergeBReaderIntoWriter;
     int64_t numCores =
         bindingData->parallelCoreCount > 0 ? bindingData->parallelCoreCount : 1;
     int64_t barrierWriteThreshold = 1;
@@ -1684,6 +1694,8 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
         rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(), 0);
     if (enableWriteBarrier) {
       // 2048 represents the tile size.
+      //maybe it is better to be a fixed number of 4 for both blackhole and wormhole. For blackhole, barrierWriteThreshold is 2, too small and harm the performance.
+      //disable it for matmul
       barrierWriteThreshold = (512 / numCores) * (1024 + 128) / 2048;
       if (barrierWriteThreshold < 1)
         barrierWriteThreshold = 1;
@@ -1791,6 +1803,7 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
 
 private:
   std::shared_ptr<CompileArgTracker> tracker;
+  bool matmulMergeBReaderIntoWriter;
 };
 
 /**
@@ -1976,10 +1989,12 @@ struct ConvertLoomLoadOp : public OpConversionPattern<::loom::CopyOp> {
   using OpConversionPattern<::loom::CopyOp>::OpConversionPattern;
 
   ConvertLoomLoadOp(TypeConverter &typeConverter, MLIRContext *context,
-                    std::shared_ptr<CompileArgTracker> tracker)
+                    std::shared_ptr<CompileArgTracker> tracker,
+                    bool matmulMergeBReaderIntoWriter)
       : OpConversionPattern<::loom::CopyOp>(typeConverter, context),
         computePattern(typeConverter, context, tracker),
-        memoryPattern(typeConverter, context, tracker) {}
+        memoryPattern(typeConverter, context, tracker,
+                      matmulMergeBReaderIntoWriter) {}
 
   LogicalResult
   matchAndRewrite(::loom::CopyOp op, OpAdaptor adaptor,
@@ -2011,10 +2026,12 @@ struct ConvertLoomStoreOp : public OpConversionPattern<::loom::CopyOp> {
   using OpConversionPattern<::loom::CopyOp>::OpConversionPattern;
 
   ConvertLoomStoreOp(TypeConverter &typeConverter, MLIRContext *context,
-                     std::shared_ptr<CompileArgTracker> tracker)
+                     std::shared_ptr<CompileArgTracker> tracker,
+                     bool matmulMergeBReaderIntoWriter)
       : OpConversionPattern<::loom::CopyOp>(typeConverter, context),
         computePattern(typeConverter, context, tracker),
-        memoryPattern(typeConverter, context, tracker) {}
+        memoryPattern(typeConverter, context, tracker,
+                      matmulMergeBReaderIntoWriter) {}
 
   LogicalResult
   matchAndRewrite(::loom::CopyOp op, OpAdaptor adaptor,
@@ -2037,12 +2054,14 @@ private:
 void mlir::loom::populateMemoryOpConversionPatterns(
     RewritePatternSet &patterns, TypeConverter &typeConverter,
     MLIRContext *context, std::shared_ptr<CompileArgTracker> tracker,
-    ReduceProtocol reduceProtocol) {
+    ReduceProtocol reduceProtocol, bool matmulMergeBReaderIntoWriter) {
   // loom.semaphore / loom.copy patterns.
   patterns.add<ConvertLoomSemaphoreTakeOp>(typeConverter, context, tracker);
   patterns.add<ConvertLoomSemaphoreGiveOp>(typeConverter, context);
-  patterns.add<ConvertLoomLoadOp>(typeConverter, context, tracker);
-  patterns.add<ConvertLoomStoreOp>(typeConverter, context, tracker);
+  patterns.add<ConvertLoomLoadOp>(typeConverter, context, tracker,
+                                  matmulMergeBReaderIntoWriter);
+  patterns.add<ConvertLoomStoreOp>(typeConverter, context, tracker,
+                                   matmulMergeBReaderIntoWriter);
   patterns.add<ConvertLoomGatherTransportOp>(typeConverter, context,
                                              std::move(tracker), reduceProtocol);
   // Reinterpret cast erasure.
