@@ -1280,12 +1280,10 @@ static bool isZeroFillForValue(linalg::FillOp fillOp, Value output) {
 }
 
 static bool hasKnownZeroFillInitializerBefore(Operation *anchor,
-                                              linalg::BatchMatmulOp op,
-                                              Value outCb) {
+                                              Value originalOut, Value outCb) {
   if (!anchor || !anchor->getBlock())
     return false;
 
-  Value originalOut = op.getOutputs()[0];
   bool sawConvertedPush = false;
   for (Operation *prev = anchor->getPrevNode(); prev;
        prev = prev->getPrevNode()) {
@@ -1397,7 +1395,7 @@ static Value intConstLike(OpBuilder &builder, Location loc, Type type,
 }
 
 static Value cmpBlockIv(ConversionPatternRewriter &rewriter, Location loc,
-                        KSplitLoopInfo &loopInfo,
+                        KSplitLoopInfo loopInfo,
                         arith::CmpIPredicate pred, int64_t value) {
   Value iv = loopInfo.loop.getInductionVar();
   Value rhs = intConstLike(rewriter, loc, iv.getType(), value);
@@ -2719,11 +2717,114 @@ static LogicalResult rewriteElementwiseGeneric(linalg::GenericOp op,
   return success();
 }
 
-static LogicalResult lowerBatchMatmulOverwrite(
-    Operation *op, Value in0Cb, Value in1Cb, Value outCb,
-    ShapedType lhsShapedType, ShapedType rhsShapedType,
-    ShapedType outShapedType, ConversionPatternRewriter &rewriter) {
-  if (!isa<CBType>(in0Cb.getType()) || !isa<CBType>(in1Cb.getType()) ||
+enum class BatchMatmulPackMode {
+  Overwrite,
+  PackL1,
+};
+
+struct BatchMatmulLoweringConfig {
+  Operation *op = nullptr;
+  Value in0Cb;
+  Value in1Cb;
+  Value outCb;
+  ShapedType lhsShapedType;
+  ShapedType rhsShapedType;
+  ShapedType outShapedType;
+  Value originalOut;
+  BatchMatmulPackMode mode = BatchMatmulPackMode::Overwrite;
+};
+
+static void emitPackL1Prologue(
+    const BatchMatmulLoweringConfig &config,
+    std::optional<KSplitLoopInfo> &kLoopInfo, Value totalOutTiles,
+    ConversionPatternRewriter &rewriter) {
+  Location loc = config.op->getLoc();
+  Operation *initAnchor =
+      kLoopInfo ? kLoopInfo->loop.getOperation() : config.op;
+  bool hasInitialOutTiles = hasKnownZeroFillInitializerBefore(
+      initAnchor, config.originalOut, config.outCb);
+
+  if (kLoopInfo) {
+    Value isFirstBlock = cmpBlockIv(rewriter, loc, *kLoopInfo,
+                                    arith::CmpIPredicate::eq,
+                                    kLoopInfo->lower);
+    scf::IfOp setupIf =
+        rewriter.create<scf::IfOp>(loc, isFirstBlock,
+                                   /*withElseRegion=*/true);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&setupIf.getThenRegion().front());
+      if (hasInitialOutTiles) {
+        CBWaitFrontOp::create(rewriter, loc, config.outCb, totalOutTiles);
+        CBPopFrontOp::create(rewriter, loc, config.outCb, totalOutTiles);
+      }
+      emitPackOverwriteMode(rewriter, loc, config.outCb);
+
+      rewriter.setInsertionPointToStart(&setupIf.getElseRegion().front());
+      Value isSecondBlock =
+          cmpBlockIv(rewriter, loc, *kLoopInfo, arith::CmpIPredicate::eq,
+                     kLoopInfo->lower + kLoopInfo->step);
+      scf::IfOp secondIf =
+          rewriter.create<scf::IfOp>(loc, isSecondBlock,
+                                     /*withElseRegion=*/false);
+      {
+        OpBuilder::InsertionGuard secondGuard(rewriter);
+        rewriter.setInsertionPointToStart(&secondIf.getThenRegion().front());
+        emitPackReconfigDataFormat(rewriter, loc, config.outCb);
+        emitPackReconfigL1Acc(rewriter, loc, 1);
+      }
+    }
+    rewriter.setInsertionPointAfter(setupIf);
+    return;
+  }
+
+  if (hasInitialOutTiles) {
+    CBWaitFrontOp::create(rewriter, loc, config.outCb, totalOutTiles);
+    CBPopFrontOp::create(rewriter, loc, config.outCb, totalOutTiles);
+  }
+  emitPackOverwriteMode(rewriter, loc, config.outCb);
+}
+
+static void emitPackL1Epilogue(
+    const BatchMatmulLoweringConfig &config,
+    std::optional<KSplitLoopInfo> &kLoopInfo, Value totalOutTiles,
+    ConversionPatternRewriter &rewriter) {
+  Location loc = config.op->getLoc();
+  if (kLoopInfo) {
+    Value isNotLastBlock =
+        cmpBlockIv(rewriter, loc, *kLoopInfo, arith::CmpIPredicate::ne,
+                   kLoopInfo->upper - kLoopInfo->step);
+    scf::IfOp finishIf =
+        rewriter.create<scf::IfOp>(loc, isNotLastBlock,
+                                   /*withElseRegion=*/true);
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPointToStart(&finishIf.getThenRegion().front());
+      CBWaitFrontOp::create(rewriter, loc, config.outCb, totalOutTiles);
+      CBPopFrontOp::create(rewriter, loc, config.outCb, totalOutTiles);
+
+      rewriter.setInsertionPointToStart(&finishIf.getElseRegion().front());
+      emitPackOverwriteMode(rewriter, loc, config.outCb);
+    }
+    rewriter.setInsertionPointAfter(finishIf);
+    return;
+  }
+
+  emitPackOverwriteMode(rewriter, loc, config.outCb);
+}
+
+static LogicalResult lowerBatchMatmul(
+    const BatchMatmulLoweringConfig &config,
+    ConversionPatternRewriter &rewriter) {
+  Operation *op = config.op;
+  Value in0Cb = config.in0Cb;
+  Value in1Cb = config.in1Cb;
+  Value outCb = config.outCb;
+  ShapedType lhsShapedType = config.lhsShapedType;
+  ShapedType rhsShapedType = config.rhsShapedType;
+  ShapedType outShapedType = config.outShapedType;
+
+  if (!op || !isa<CBType>(in0Cb.getType()) || !isa<CBType>(in1Cb.getType()) ||
       !isa<CBType>(outCb.getType()))
     return failure();
 
@@ -2751,6 +2852,13 @@ static LogicalResult lowerBatchMatmulOverwrite(
            << "failed to choose matmul subblock for DST capacity "
            << dstCapacity;
 
+  Value totalOutTiles = i32Const(rewriter, loc, tileInfo->outTilesTotal);
+  std::optional<KSplitLoopInfo> kLoopInfo;
+  if (config.mode == BatchMatmulPackMode::PackL1) {
+    kLoopInfo = getEnclosingStaticKSplitLoop(op);
+    emitPackL1Prologue(config, kLoopInfo, totalOutTiles, rewriter);
+  }
+
   Value in0TileCount = i32Const(rewriter, loc, tileInfo->in0TilesTotal);
   Value in1TileCount = i32Const(rewriter, loc, tileInfo->in1TilesTotal);
   if (in0Cb == in1Cb) {
@@ -2763,10 +2871,9 @@ static LogicalResult lowerBatchMatmulOverwrite(
     CBWaitFrontOp::create(rewriter, loc, in1Cb, in1TileCount);
   }
 
-  Value totalOutTiles = i32Const(rewriter, loc, tileInfo->outTilesTotal);
-  Value batchTiles = i32Const(rewriter, loc, tileInfo->outTilesPerBatch);
   Value in0BatchStride = i32Const(rewriter, loc, tileInfo->in0TilesPerBatch);
   Value in1BatchStride = i32Const(rewriter, loc, tileInfo->in1TilesPerBatch);
+  Value outBatchStride = i32Const(rewriter, loc, tileInfo->outTilesPerBatch);
   Value batchCount = i32Const(rewriter, loc, tileInfo->batchSize);
   CBReserveBackOp::create(rewriter, loc, outCb, totalOutTiles);
 
@@ -2778,7 +2885,8 @@ static LogicalResult lowerBatchMatmulOverwrite(
       rewriter.create<arith::MulIOp>(loc, batchIdx, in0BatchStride);
   Value in1BatchBase =
       rewriter.create<arith::MulIOp>(loc, batchIdx, in1BatchStride);
-  Value outTileBase = rewriter.create<arith::MulIOp>(loc, batchIdx, batchTiles);
+  Value outBatchBase =
+      rewriter.create<arith::MulIOp>(loc, batchIdx, outBatchStride);
 
   auto minI32 = [&](Value lhs, Value rhs) -> Value {
     Value takeLhs = rewriter.create<arith::CmpIOp>(
@@ -2794,8 +2902,6 @@ static LogicalResult lowerBatchMatmulOverwrite(
              << "matmul subblock uses " << (maxRt * maxCt)
              << " DST tiles, exceeding capacity " << dstCapacity;
 
-    Value ctDim = actualCt;
-    Value rtDim = actualRt;
     Value in0RowOffset = rewriter.create<arith::MulIOp>(loc, rowBase, ktDim);
     Value in0TileIdx =
         rewriter.create<arith::AddIOp>(loc, in0BatchBase, in0RowOffset);
@@ -2804,12 +2910,12 @@ static LogicalResult lowerBatchMatmulOverwrite(
 
     rewriter.create<MatmulBlockInitShortOp>(
         loc, TypeRange{},
-        ValueRange{in0Cb, in1Cb, transpose, ctDim, rtDim, ktDim});
+        ValueRange{in0Cb, in1Cb, transpose, actualCt, actualRt, ktDim});
     TileRegsAcquireOp::create(rewriter, loc);
     rewriter.create<ExperimentalMatmulBlockOp>(
         loc, TypeRange{},
         ValueRange{in0Cb, in1Cb, in0TileIdx, in1TileIdx, zeroI32, transpose,
-                   ctDim, rtDim, ktDim, ntDim});
+                   actualCt, actualRt, ktDim, ntDim});
     TileRegsCommitOp::create(rewriter, loc);
     TileRegsWaitOp::create(rewriter, loc);
 
@@ -2823,7 +2929,7 @@ static LogicalResult lowerBatchMatmulOverwrite(
       Value globalRow = rewriter.create<arith::AddIOp>(loc, rowBase, localRow);
       Value outRowOffset = rewriter.create<arith::MulIOp>(loc, globalRow, ntDim);
       Value outRowBase =
-          rewriter.create<arith::AddIOp>(loc, outTileBase, outRowOffset);
+          rewriter.create<arith::AddIOp>(loc, outBatchBase, outRowOffset);
 
       scf::ForOp packColLoop =
           scf::ForOp::create(rewriter, loc, zeroI32, actualCt, oneI32);
@@ -2875,227 +2981,8 @@ static LogicalResult lowerBatchMatmulOverwrite(
 
   rewriter.setInsertionPointAfter(batchLoop);
   CBPushBackOp::create(rewriter, loc, outCb, totalOutTiles);
-  return success();
-}
-
-static LogicalResult lowerBatchMatmulPackL1(
-    linalg::BatchMatmulOp op, Value in0Cb, Value in1Cb, Value outCb,
-    ShapedType lhsShapedType, ShapedType rhsShapedType,
-    ShapedType outShapedType, ConversionPatternRewriter &rewriter) {
-  if (!isa<CBType>(in0Cb.getType()) || !isa<CBType>(in1Cb.getType()) ||
-      !isa<CBType>(outCb.getType()))
-    return failure();
-
-  std::optional<MatmulTileInfo> tileInfo =
-      getMatmulTileInfo(lhsShapedType, rhsShapedType, outShapedType);
-  if (!tileInfo || tileInfo->batchSize <= 0)
-    return failure();
-
-  if (lhsShapedType.getRank() != 3 || rhsShapedType.getRank() != 3 ||
-      outShapedType.getRank() != 3)
-    return failure();
-
-  Location loc = op.getLoc();
-  Value zeroI32 = i32Const(rewriter, loc, 0);
-  Value oneI32 = i32Const(rewriter, loc, 1);
-  Value transpose = zeroI32;
-  Value ntDim = i32Const(rewriter, loc, tileInfo->nt);
-  Value ktDim = i32Const(rewriter, loc, tileInfo->kt);
-
-  int64_t dstCapacity = getDstCapacityTiles(outShapedType);
-  std::optional<MatmulSubblockInfo> subblock =
-      chooseMatmulSubblock(tileInfo->rt, tileInfo->ct, dstCapacity);
-  if (!subblock)
-    return op.emitOpError()
-           << "failed to choose pack-L1 matmul subblock for DST capacity "
-           << dstCapacity;
-  int64_t rowStepStatic = subblock->rt;
-  int64_t colStepStatic = subblock->ct;
-
-  std::optional<KSplitLoopInfo> kLoopInfo =
-      getEnclosingStaticKSplitLoop(op.getOperation());
-  Operation *initAnchor =
-      kLoopInfo ? kLoopInfo->loop.getOperation() : op.getOperation();
-  bool hasInitialOutTiles =
-      hasKnownZeroFillInitializerBefore(initAnchor, op, outCb);
-  Value totalOutTiles = i32Const(rewriter, loc, tileInfo->outTilesTotal);
-
-  if (kLoopInfo) {
-    Value isFirstBlock = cmpBlockIv(rewriter, loc, *kLoopInfo,
-                                    arith::CmpIPredicate::eq,
-                                    kLoopInfo->lower);
-    scf::IfOp setupIf =
-        rewriter.create<scf::IfOp>(loc, isFirstBlock,
-                                   /*withElseRegion=*/true);
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(&setupIf.getThenRegion().front());
-      if (hasInitialOutTiles) {
-        CBWaitFrontOp::create(rewriter, loc, outCb, totalOutTiles);
-        CBPopFrontOp::create(rewriter, loc, outCb, totalOutTiles);
-      }
-      emitPackOverwriteMode(rewriter, loc, outCb);
-
-      rewriter.setInsertionPointToStart(&setupIf.getElseRegion().front());
-      Value isSecondBlock = cmpBlockIv(rewriter, loc, *kLoopInfo,
-                                       arith::CmpIPredicate::eq,
-                                       kLoopInfo->lower + kLoopInfo->step);
-      scf::IfOp secondIf =
-          rewriter.create<scf::IfOp>(loc, isSecondBlock,
-                                     /*withElseRegion=*/false);
-      {
-        OpBuilder::InsertionGuard secondGuard(rewriter);
-        rewriter.setInsertionPointToStart(&secondIf.getThenRegion().front());
-        emitPackReconfigDataFormat(rewriter, loc, outCb);
-        emitPackReconfigL1Acc(rewriter, loc, 1);
-      }
-    }
-    rewriter.setInsertionPointAfter(setupIf);
-  } else {
-    if (hasInitialOutTiles) {
-      CBWaitFrontOp::create(rewriter, loc, outCb, totalOutTiles);
-      CBPopFrontOp::create(rewriter, loc, outCb, totalOutTiles);
-    }
-    emitPackOverwriteMode(rewriter, loc, outCb);
-  }
-
-  Value in0TileCount = i32Const(rewriter, loc, tileInfo->in0TilesTotal);
-  Value in1TileCount = i32Const(rewriter, loc, tileInfo->in1TilesTotal);
-  if (in0Cb == in1Cb) {
-    int64_t sharedTiles =
-        std::max(tileInfo->in0TilesTotal, tileInfo->in1TilesTotal);
-    CBWaitFrontOp::create(rewriter, loc, in0Cb,
-                          i32Const(rewriter, loc, sharedTiles));
-  } else {
-    CBWaitFrontOp::create(rewriter, loc, in0Cb, in0TileCount);
-    CBWaitFrontOp::create(rewriter, loc, in1Cb, in1TileCount);
-  }
-
-  Value in0BatchStride = i32Const(rewriter, loc, tileInfo->in0TilesPerBatch);
-  Value in1BatchStride = i32Const(rewriter, loc, tileInfo->in1TilesPerBatch);
-  Value outBatchStride = i32Const(rewriter, loc, tileInfo->outTilesPerBatch);
-  Value batchCount = i32Const(rewriter, loc, tileInfo->batchSize);
-  CBReserveBackOp::create(rewriter, loc, outCb, totalOutTiles);
-
-  scf::ForOp batchLoop =
-      scf::ForOp::create(rewriter, loc, zeroI32, batchCount, oneI32);
-  rewriter.setInsertionPointToStart(batchLoop.getBody());
-  Value batchIdx = batchLoop.getInductionVar();
-  Value in0BatchBase =
-      rewriter.create<arith::MulIOp>(loc, batchIdx, in0BatchStride);
-  Value in1BatchBase =
-      rewriter.create<arith::MulIOp>(loc, batchIdx, in1BatchStride);
-  Value outBatchBase =
-      rewriter.create<arith::MulIOp>(loc, batchIdx, outBatchStride);
-
-  auto minI32 = [&](Value lhs, Value rhs) -> Value {
-    Value takeLhs = rewriter.create<arith::CmpIOp>(
-        loc, arith::CmpIPredicate::slt, lhs, rhs);
-    return rewriter.create<arith::SelectOp>(loc, takeLhs, lhs, rhs);
-  };
-
-  auto emitSubblock = [&](Value rowBase, Value colBase, Value actualRt,
-                          Value actualCt, int64_t maxRt,
-                          int64_t maxCt) -> LogicalResult {
-    if (maxRt * maxCt > dstCapacity)
-      return op.emitOpError()
-             << "matmul subblock uses " << (maxRt * maxCt)
-             << " DST tiles, exceeding capacity " << dstCapacity;
-
-    Value in0RowOffset = rewriter.create<arith::MulIOp>(loc, rowBase, ktDim);
-    Value in0TileIdx =
-        rewriter.create<arith::AddIOp>(loc, in0BatchBase, in0RowOffset);
-    Value in1TileIdx =
-        rewriter.create<arith::AddIOp>(loc, in1BatchBase, colBase);
-
-    TileRegsAcquireOp::create(rewriter, loc);
-    rewriter.create<MatmulBlockInitShortOp>(
-        loc, TypeRange{},
-        ValueRange{in0Cb, in1Cb, transpose, actualCt, actualRt, ktDim});
-    rewriter.create<ExperimentalMatmulBlockOp>(
-        loc, TypeRange{},
-        ValueRange{in0Cb, in1Cb, in0TileIdx, in1TileIdx, zeroI32, transpose,
-                   actualCt, actualRt, ktDim, ntDim});
-
-    TileRegsCommitOp::create(rewriter, loc);
-    TileRegsWaitOp::create(rewriter, loc);
-
-    scf::ForOp packRowLoop =
-        scf::ForOp::create(rewriter, loc, zeroI32, actualRt, oneI32);
-    {
-      OpBuilder::InsertionGuard rowGuard(rewriter);
-      rewriter.setInsertionPointToStart(packRowLoop.getBody());
-      Value localRow = packRowLoop.getInductionVar();
-      Value dstRowBase = rewriter.create<arith::MulIOp>(loc, localRow, actualCt);
-      Value globalRow = rewriter.create<arith::AddIOp>(loc, rowBase, localRow);
-      Value outRowOffset = rewriter.create<arith::MulIOp>(loc, globalRow, ntDim);
-      Value outRowBase =
-          rewriter.create<arith::AddIOp>(loc, outBatchBase, outRowOffset);
-
-      scf::ForOp packColLoop =
-          scf::ForOp::create(rewriter, loc, zeroI32, actualCt, oneI32);
-      OpBuilder::InsertionGuard colGuard(rewriter);
-      rewriter.setInsertionPointToStart(packColLoop.getBody());
-      Value localCol = packColLoop.getInductionVar();
-      Value dstIdx = rewriter.create<arith::AddIOp>(loc, dstRowBase, localCol);
-      Value outCol = rewriter.create<arith::AddIOp>(loc, colBase, localCol);
-      Value outTileIdx = rewriter.create<arith::AddIOp>(loc, outRowBase, outCol);
-      PackTileOp::create(rewriter, loc, dstIdx, outCb, outTileIdx);
-    }
-
-    rewriter.setInsertionPointAfter(packRowLoop);
-    TileRegsReleaseOp::create(rewriter, loc);
-    return success();
-  };
-
-  Value rtTotal = i32Const(rewriter, loc, tileInfo->rt);
-  Value ctTotal = i32Const(rewriter, loc, tileInfo->ct);
-  Value rowStep = i32Const(rewriter, loc, rowStepStatic);
-  Value colStep = i32Const(rewriter, loc, colStepStatic);
-  scf::ForOp rowLoop =
-      scf::ForOp::create(rewriter, loc, zeroI32, rtTotal, rowStep);
-  {
-    OpBuilder::InsertionGuard rowGuard(rewriter);
-    rewriter.setInsertionPointToStart(rowLoop.getBody());
-    Value rowBase = rowLoop.getInductionVar();
-    Value remainingRt = rewriter.create<arith::SubIOp>(loc, rtTotal, rowBase);
-    Value actualRt = minI32(remainingRt, rowStep);
-
-    scf::ForOp colLoop =
-        scf::ForOp::create(rewriter, loc, zeroI32, ctTotal, colStep);
-    OpBuilder::InsertionGuard colGuard(rewriter);
-    rewriter.setInsertionPointToStart(colLoop.getBody());
-    Value colBase = colLoop.getInductionVar();
-    Value remainingCt = rewriter.create<arith::SubIOp>(loc, ctTotal, colBase);
-    Value actualCt = minI32(remainingCt, colStep);
-    if (failed(emitSubblock(rowBase, colBase, actualRt, actualCt,
-                            rowStepStatic, colStepStatic)))
-      return failure();
-  }
-  rewriter.setInsertionPointAfter(rowLoop);
-
-  rewriter.setInsertionPointAfter(batchLoop);
-  CBPushBackOp::create(rewriter, loc, outCb, totalOutTiles);
-  if (kLoopInfo) {
-    Value isNotLastBlock = cmpBlockIv(rewriter, loc, *kLoopInfo,
-                                      arith::CmpIPredicate::ne,
-                                      kLoopInfo->upper - kLoopInfo->step);
-    scf::IfOp finishIf =
-        rewriter.create<scf::IfOp>(loc, isNotLastBlock,
-                                   /*withElseRegion=*/true);
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPointToStart(&finishIf.getThenRegion().front());
-      CBWaitFrontOp::create(rewriter, loc, outCb, totalOutTiles);
-      CBPopFrontOp::create(rewriter, loc, outCb, totalOutTiles);
-
-      rewriter.setInsertionPointToStart(&finishIf.getElseRegion().front());
-      emitPackOverwriteMode(rewriter, loc, outCb);
-    }
-    rewriter.setInsertionPointAfter(finishIf);
-  } else {
-    emitPackOverwriteMode(rewriter, loc, outCb);
-  }
+  if (config.mode == BatchMatmulPackMode::PackL1)
+    emitPackL1Epilogue(config, kLoopInfo, totalOutTiles, rewriter);
   return success();
 }
 
@@ -3116,10 +3003,17 @@ public:
     auto lhsShapedType = dyn_cast<ShapedType>(op.getInputs()[0].getType());
     auto rhsShapedType = dyn_cast<ShapedType>(op.getInputs()[1].getType());
     auto outShapedType = dyn_cast<ShapedType>(op.getOutputs()[0].getType());
-    if (failed(lowerBatchMatmulPackL1(
-            op, adaptor.getInputs()[0], adaptor.getInputs()[1],
-            adaptor.getOutputs()[0], lhsShapedType, rhsShapedType,
-            outShapedType, rewriter)))
+    BatchMatmulLoweringConfig config{
+        op.getOperation(),
+        adaptor.getInputs()[0],
+        adaptor.getInputs()[1],
+        adaptor.getOutputs()[0],
+        lhsShapedType,
+        rhsShapedType,
+        outShapedType,
+        op.getOutputs()[0],
+        BatchMatmulPackMode::PackL1};
+    if (failed(lowerBatchMatmul(config, rewriter)))
       return failure();
 
     rewriter.eraseOp(op);
@@ -3141,10 +3035,17 @@ public:
     auto lhsShapedType = dyn_cast<ShapedType>(op.getLhs().getType());
     auto rhsShapedType = dyn_cast<ShapedType>(op.getRhs().getType());
     auto outShapedType = dyn_cast<ShapedType>(op.getOuts().getType());
-    if (failed(lowerBatchMatmulOverwrite(
-            op.getOperation(), adaptor.getLhs(), adaptor.getRhs(),
-            adaptor.getOuts(), lhsShapedType, rhsShapedType, outShapedType,
-            rewriter)))
+    BatchMatmulLoweringConfig config{
+        op.getOperation(),
+        adaptor.getLhs(),
+        adaptor.getRhs(),
+        adaptor.getOuts(),
+        lhsShapedType,
+        rhsShapedType,
+        outShapedType,
+        op.getOuts(),
+        BatchMatmulPackMode::Overwrite};
+    if (failed(lowerBatchMatmul(config, rewriter)))
       return failure();
 
     rewriter.eraseOp(op);
