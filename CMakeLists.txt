@@ -106,6 +106,7 @@ target_include_directories(TTMLIRTTMetalDialect INTERFACE
 
 set(LOOM2TTKERNEL_SOURCES
   src/TTKernelUtils.cpp
+  src/MatmulStreamPreprocess.cpp
   src/RuntimeArgLayout.cpp
   src/MemoryOpToTTKernel.cpp
   src/ComputeOpToTTKernel.cpp

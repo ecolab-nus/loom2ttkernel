@@ -59,6 +59,18 @@ inline constexpr llvm::StringLiteral kCBConstInternalSlotAttrName =
     "loom.ttkernel.cb_const_internal_slot";
 inline constexpr llvm::StringLiteral kCBConstDeclAttrName =
     "loom.ttkernel.cb_const_decl";
+inline constexpr llvm::StringLiteral kMatmulSubblockRowsAttrName =
+    "loom.ttkernel.matmul_subblock_rows";
+inline constexpr llvm::StringLiteral kMatmulSubblockColsAttrName =
+    "loom.ttkernel.matmul_subblock_cols";
+inline constexpr llvm::StringLiteral kMatmulStreamOutputSubblocksAttrName =
+    "loom.ttkernel.matmul_stream_output_subblocks";
+inline constexpr llvm::StringLiteral kMatmulStreamBridgeAttrName =
+    "loom.ttkernel.matmul_stream_bridge";
+inline constexpr llvm::StringLiteral kMatmulStreamStoreAttrName =
+    "loom.ttkernel.matmul_stream_store";
+inline constexpr llvm::StringLiteral kMatmulStreamFinalPackAttrName =
+    "loom.ttkernel.matmul_stream_final_pack";
 
 inline constexpr llvm::StringLiteral kMergedBIntoWriterStrategy =
     "matmul_merge_b_reader_into_writer";

@@ -9,6 +9,7 @@
 
 #include "MemoryOpToTTKernel.h"
 #include "FuncOpToTTKernel.h"
+#include "MatmulStreamPreprocess.h"
 #include "TTKernelAttrs.h"
 #include "TTKernelUtils.h"
 
@@ -1645,9 +1646,6 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
     if (!accessorOp)
       return op.emitOpError("missing TensorAccessor runtime arg for DRAM store");
 
-    CBWaitFrontOp::create(rewriter, loc, cb, numPages);
-    Value l1Addr = GetReadPtrOp::create(rewriter, loc, cb);
-
     Value baseElemOffset = offsetI32;
     auto resultType = cast<MemRefType>(reinterpretCastOp.getResult().getType());
     ArrayRef<int64_t> shape = resultType.getShape();
@@ -1680,9 +1678,133 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
     Value numTileColsVal = rewriter.create<arith::ConstantIntOp>(
         loc, rewriter.getI32Type(), numTileCols);
     Value stride0Val = rewriter.create<arith::ConstantIntOp>(
-      loc, rewriter.getI32Type(), (strides.size() > 1) ? strides[strides.size() - 2] : 1);
+        loc, rewriter.getI32Type(),
+        (strides.size() > 1) ? strides[strides.size() - 2] : 1);
     Value stride1Val = rewriter.create<arith::ConstantIntOp>(
-      loc, rewriter.getI32Type(), (strides.size() > 0) ? strides[strides.size() - 1] : 1);
+        loc, rewriter.getI32Type(),
+        (strides.size() > 0) ? strides[strides.size() - 1] : 1);
+
+    if (op->hasAttr(kMatmulStreamStoreAttrName)) {
+      FailureOr<MatmulSubblockInfo> subblock =
+          getMatmulSubblockAttrs(op.getOperation());
+      if (failed(subblock))
+        return op.emitOpError()
+               << "missing precomputed streamed matmul store subblock attrs";
+
+      auto minI32 = [&](Value lhs, Value rhs) -> Value {
+        Value takeLhs = rewriter.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::slt, lhs, rhs);
+        return rewriter.create<arith::SelectOp>(loc, takeLhs, lhs, rhs);
+      };
+
+      auto emitWriteTile = [&](Value tileRow, Value tileCol, Value tileL1Addr) {
+        Value rowOffset =
+            arith::MulIOp::create(rewriter, loc, tileRow, tileDimVal);
+        rowOffset =
+            arith::MulIOp::create(rewriter, loc, rowOffset, stride0Val);
+        Value colOffset =
+            arith::MulIOp::create(rewriter, loc, tileCol, tileDimVal);
+        colOffset =
+            arith::MulIOp::create(rewriter, loc, colOffset, stride1Val);
+        Value tileElemOffset =
+            arith::AddIOp::create(rewriter, loc, rowOffset, colOffset);
+        Value totalElemOffset =
+            arith::AddIOp::create(rewriter, loc, baseElemOffset, tileElemOffset);
+        Value rowIdx =
+            arith::DivSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
+        Value colIdx =
+            arith::RemSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
+        Value tilesPerRow =
+            arith::DivSIOp::create(rewriter, loc, stride0Val, tileDimVal);
+        Value rowTile =
+            arith::DivSIOp::create(rewriter, loc, rowIdx, tileDimVal);
+        Value rowTileBase =
+            arith::MulIOp::create(rewriter, loc, rowTile, tilesPerRow);
+        Value colTile =
+            arith::DivSIOp::create(rewriter, loc, colIdx, tileDimVal);
+        Value tileId =
+            arith::AddIOp::create(rewriter, loc, rowTileBase, colTile);
+        NocAsyncWriteTileOp::create(rewriter, loc, tileId, accessorOp,
+                                    tileL1Addr);
+      };
+
+      Value rowStep = rewriter.create<arith::ConstantIntOp>(
+          loc, rewriter.getI32Type(), subblock->rt);
+      Value colStep = rewriter.create<arith::ConstantIntOp>(
+          loc, rewriter.getI32Type(), subblock->ct);
+      scf::ForOp rowLoop =
+          scf::ForOp::create(rewriter, loc, loopConst0, numTileRowsVal,
+                             rowStep);
+      {
+        OpBuilder::InsertionGuard rowGuard(rewriter);
+        rewriter.setInsertionPointToStart(rowLoop.getBody());
+        Value rowBase = rowLoop.getInductionVar();
+        Value remainingRt =
+            arith::SubIOp::create(rewriter, loc, numTileRowsVal, rowBase);
+        Value actualRt = minI32(remainingRt, rowStep);
+
+        scf::ForOp colLoop =
+            scf::ForOp::create(rewriter, loc, loopConst0, numTileColsVal,
+                               colStep);
+        {
+          OpBuilder::InsertionGuard colGuard(rewriter);
+          rewriter.setInsertionPointToStart(colLoop.getBody());
+          Value colBase = colLoop.getInductionVar();
+          Value remainingCt =
+              arith::SubIOp::create(rewriter, loc, numTileColsVal, colBase);
+          Value actualCt = minI32(remainingCt, colStep);
+          Value chunk =
+              arith::MulIOp::create(rewriter, loc, actualRt, actualCt);
+
+          CBWaitFrontOp::create(rewriter, loc, cb, chunk);
+          Value chunkReadPtr = GetReadPtrOp::create(rewriter, loc, cb);
+
+          scf::ForOp localRowLoop =
+              scf::ForOp::create(rewriter, loc, loopConst0, actualRt,
+                                 loopConst1);
+          {
+            OpBuilder::InsertionGuard localRowGuard(rewriter);
+            rewriter.setInsertionPointToStart(localRowLoop.getBody());
+            Value localRow = localRowLoop.getInductionVar();
+            Value globalRow =
+                arith::AddIOp::create(rewriter, loc, rowBase, localRow);
+            Value rowTileOffset =
+                arith::MulIOp::create(rewriter, loc, localRow, actualCt);
+            Value rowByteOffset =
+                arith::MulIOp::create(rewriter, loc, rowTileOffset, pageSize);
+            Value rowReadPtr =
+                arith::AddIOp::create(rewriter, loc, chunkReadPtr, rowByteOffset);
+
+            scf::ForOp localColLoop =
+                scf::ForOp::create(rewriter, loc, loopConst0, actualCt,
+                                   loopConst1);
+            {
+              OpBuilder::InsertionGuard localColGuard(rewriter);
+              rewriter.setInsertionPointToStart(localColLoop.getBody());
+              Value localCol = localColLoop.getInductionVar();
+              Value globalCol =
+                  arith::AddIOp::create(rewriter, loc, colBase, localCol);
+              Value colByteOffset =
+                  arith::MulIOp::create(rewriter, loc, localCol, pageSize);
+              Value tileReadPtr =
+                  arith::AddIOp::create(rewriter, loc, rowReadPtr, colByteOffset);
+              emitWriteTile(globalRow, globalCol, tileReadPtr);
+            }
+          }
+
+          rewriter.setInsertionPointAfter(localRowLoop);
+          NocAsyncWriteBarrierOp::create(rewriter, loc);
+          CBPopFrontOp::create(rewriter, loc, cb, chunk);
+        }
+      }
+
+      rewriter.setInsertionPointAfter(rowLoop);
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    CBWaitFrontOp::create(rewriter, loc, cb, numPages);
+    Value l1Addr = GetReadPtrOp::create(rewriter, loc, cb);
 
     int64_t totalTiles = numTileRows * numTileCols;
     bool enableWriteBarrier =

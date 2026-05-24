@@ -5,6 +5,7 @@
 
 #include "ComputeOpToTTKernel.h"
 #include "MemoryOpToTTKernel.h"
+#include "MatmulStreamPreprocess.h"
 #include "SCFOpToTTKernel.h"
 #include "FuncOpToTTKernel.h"
 #include "TTKernelAttrs.h"
@@ -634,6 +635,11 @@ public:
                 "For 2D multicast matmul, duplicate receiver data-movement "
                 "kernels on the right-side internal cores with alternate NOCs"),
             llvm::cl::init(false)),
+        matmulStreamOutputSubblocks(
+            *this, "matmul-stream-output-subblocks",
+            llvm::cl::desc(
+                "For matmul, stream output subblocks from compute to writer"),
+            llvm::cl::init(false)),
         reduceProtocolOpt(
             *this, "reduce-protocol",
             llvm::cl::desc("Reduce synchronization protocol "
@@ -658,6 +664,11 @@ public:
                 "For 2D multicast matmul, duplicate receiver data-movement "
                 "kernels on the right-side internal cores with alternate NOCs"),
             llvm::cl::init(false)),
+        matmulStreamOutputSubblocks(
+            *this, "matmul-stream-output-subblocks",
+            llvm::cl::desc(
+                "For matmul, stream output subblocks from compute to writer"),
+            llvm::cl::init(false)),
         reduceProtocolOpt(
             *this, "reduce-protocol",
             llvm::cl::desc("Reduce synchronization protocol "
@@ -671,6 +682,8 @@ public:
         static_cast<bool>(other.matmulMergeBReaderIntoWriter);
     matmulSplitHalfDataMovementCores =
         static_cast<bool>(other.matmulSplitHalfDataMovementCores);
+    matmulStreamOutputSubblocks =
+        static_cast<bool>(other.matmulStreamOutputSubblocks);
     reduceProtocolOpt = other.reduceProtocolOpt;
     reduceProtocolDeprecated = other.reduceProtocolDeprecated;
   }
@@ -699,6 +712,7 @@ public:
 
   Option<bool> matmulMergeBReaderIntoWriter;
   Option<bool> matmulSplitHalfDataMovementCores;
+  Option<bool> matmulStreamOutputSubblocks;
   Option<std::string> reduceProtocolOpt;
   /// @deprecated Use reduce-protocol instead.
   Option<std::string> reduceProtocolDeprecated;
@@ -752,6 +766,20 @@ public:
                      "loom.gather + linalg.generic sum");
     });
     if (sawLegacyReduceSum) {
+      signalPassFailure();
+      return;
+    }
+
+    if (failed(rewriteMatmulToBatch1Matmul(module))) {
+      signalPassFailure();
+      return;
+    }
+    if (failed(rewriteLoomMatmulToBatch1LoomBatchMatmul(module))) {
+      signalPassFailure();
+      return;
+    }
+    if (failed(preprocessMatmulSubblocksAndStreams(
+            module, matmulStreamOutputSubblocks))) {
       signalPassFailure();
       return;
     }
@@ -821,13 +849,11 @@ public:
       return;
     }
 
-    if (failed(rewriteMatmulToBatch1Matmul(module))) {
-      signalPassFailure();
-      return;
-    }
-    if (failed(rewriteLoomMatmulToBatch1LoomBatchMatmul(module))) {
-      signalPassFailure();
-      return;
+    if (matmulStreamOutputSubblocks) {
+      if (failed(prepareMatmulStreamOutputLowering(module))) {
+        signalPassFailure();
+        return;
+      }
     }
 
     // Step 3.5: Replace index-type function arguments with GetArgValOp.
