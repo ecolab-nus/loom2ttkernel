@@ -58,6 +58,7 @@ namespace {
 enum class FlashAttentionGenericKind {
   Reduction,
   FusedMulBcastAdd,
+  InplaceMulBcastCols,
   SimpleBinaryTile,
   Elementwise
 };
@@ -293,6 +294,7 @@ static bool isSupportedElementwiseGeneric(linalg::GenericOp op) {
 }
 
 static bool isSupportedFusedMulBcastAddGeneric(linalg::GenericOp op);
+static bool isSupportedInplaceMulBcastColsGeneric(linalg::GenericOp op);
 static bool isSupportedSimpleBinaryTileGeneric(linalg::GenericOp op);
 
 template <typename OpTy>
@@ -315,6 +317,9 @@ classifyFlashAttentionGeneric(linalg::GenericOp op) {
 
   if (isSupportedFusedMulBcastAddGeneric(op))
     return FlashAttentionGenericKind::FusedMulBcastAdd;
+
+  if (isSupportedInplaceMulBcastColsGeneric(op))
+    return FlashAttentionGenericKind::InplaceMulBcastCols;
 
   if (isSupportedSimpleBinaryTileGeneric(op))
     return FlashAttentionGenericKind::SimpleBinaryTile;
@@ -669,10 +674,16 @@ enum class SimpleBinaryTileKind {
   Sub
 };
 
+enum class SimpleBinaryTileUnaryKind {
+  Exp,
+  Log
+};
+
 struct SimpleBinaryTileAnalysis {
   SimpleBinaryTileKind kind = SimpleBinaryTileKind::Add;
   GenericBodyTileOperand lhs;
   GenericBodyTileOperand rhs;
+  SmallVector<SimpleBinaryTileUnaryKind, 2> unaryTail;
   int64_t outTiles = 0;
 };
 
@@ -709,11 +720,34 @@ static LogicalResult analyzeSimpleBinaryTileGeneric(
   if (!yieldOp || yieldOp.getValues().size() != 1)
     return failure();
 
-  Value yielded = yieldOp.getValues().front();
-  Operation *defOp = yielded.getDefiningOp();
+  Value binaryValue = yieldOp.getValues().front();
+  SmallVector<SimpleBinaryTileUnaryKind, 2> unaryTail;
+  SmallVector<Operation *, 4> expectedOps;
+  while (Operation *defOp = binaryValue.getDefiningOp()) {
+    if (defOp->getBlock() != &op.getRegion().front())
+      return failure();
+
+    if (auto expOp = dyn_cast<math::ExpOp>(defOp)) {
+      unaryTail.push_back(SimpleBinaryTileUnaryKind::Exp);
+      expectedOps.push_back(defOp);
+      binaryValue = expOp.getOperand();
+      continue;
+    }
+
+    if (auto logOp = dyn_cast<math::LogOp>(defOp)) {
+      unaryTail.push_back(SimpleBinaryTileUnaryKind::Log);
+      expectedOps.push_back(defOp);
+      binaryValue = logOp.getOperand();
+      continue;
+    }
+
+    break;
+  }
+
+  Operation *defOp = binaryValue.getDefiningOp();
   if (!defOp || defOp->getBlock() != &op.getRegion().front())
     return failure();
-  SmallVector<Operation *, 1> expectedOps{defOp};
+  expectedOps.push_back(defOp);
   if (!bodyHasOnlyOps(op, expectedOps))
     return failure();
 
@@ -742,6 +776,8 @@ static LogicalResult analyzeSimpleBinaryTileGeneric(
 
   analysis.lhs = *lhsOperand;
   analysis.rhs = *rhsOperand;
+  std::reverse(unaryTail.begin(), unaryTail.end());
+  analysis.unaryTail = std::move(unaryTail);
   analysis.outTiles = *outTiles;
   return success();
 }
@@ -932,6 +968,46 @@ static bool matchMulOperands(linalg::GenericOp op, arith::MulFOp mulOp,
           matchInputBlockArg(op, mulOp.getRhs(), lhsIdx));
 }
 
+static LogicalResult analyzeMulBcastColsShape(
+    linalg::GenericOp op, unsigned accInputIdx, unsigned scaleInputIdx,
+    FusedMulBcastAddAnalysis &analysis) {
+  if (accInputIdx >= op.getNumDpsInputs() ||
+      scaleInputIdx >= op.getNumDpsInputs())
+    return failure();
+
+  auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
+  auto accType = dyn_cast<ShapedType>(op.getDpsInputs()[accInputIdx].getType());
+  auto scaleType =
+      dyn_cast<ShapedType>(op.getDpsInputs()[scaleInputIdx].getType());
+  if (!outType || !accType || !scaleType || !outType.hasStaticShape() ||
+      !accType.hasStaticShape() || !scaleType.hasStaticShape() ||
+      accType.getShape() != outType.getShape() ||
+      scaleType.getRank() != outType.getRank())
+    return failure();
+
+  auto outTileInfo = getElementwiseTileShapeInfo(outType);
+  auto scaleTileInfo = getElementwiseTileShapeInfo(scaleType);
+  if (!outTileInfo || !scaleTileInfo || outTileInfo->dimExtents.empty())
+    return failure();
+  unsigned bcastDim = outTileInfo->dimExtents.size() - 1;
+  if (!hasSameRankTileShapeBroadcastingDim(
+          scaleTileInfo->dimExtents, outTileInfo->dimExtents, bcastDim))
+    return failure();
+
+  int64_t cols = outTileInfo->dimExtents.back();
+  if (cols <= 0 || outTileInfo->totalTiles % cols != 0)
+    return failure();
+  int64_t rows = outTileInfo->totalTiles / cols;
+  if (rows <= 0 || scaleTileInfo->totalTiles != rows)
+    return failure();
+
+  analysis.rows = rows;
+  analysis.cols = cols;
+  analysis.outTiles = outTileInfo->totalTiles;
+  analysis.scaleTiles = scaleTileInfo->totalTiles;
+  return success();
+}
+
 static LogicalResult analyzeFusedMulBcastAddGeneric(
     linalg::GenericOp op, FusedMulBcastAddAnalysis &analysis) {
   if (op.getNumDpsInputs() != 3 || op.getNumDpsInits() != 1 ||
@@ -953,30 +1029,12 @@ static LogicalResult analyzeFusedMulBcastAddGeneric(
 
   auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
   auto addType = dyn_cast<ShapedType>(op.getDpsInputs()[0].getType());
-  auto accType = dyn_cast<ShapedType>(op.getDpsInputs()[1].getType());
-  auto scaleType = dyn_cast<ShapedType>(op.getDpsInputs()[2].getType());
-  if (!outType || !addType || !accType || !scaleType ||
-      !outType.hasStaticShape() || !addType.hasStaticShape() ||
-      !accType.hasStaticShape() || !scaleType.hasStaticShape() ||
-      addType.getShape() != outType.getShape() ||
-      accType.getShape() != outType.getShape() ||
-      scaleType.getRank() != outType.getRank())
+  if (!outType || !addType || !outType.hasStaticShape() ||
+      !addType.hasStaticShape() || addType.getShape() != outType.getShape())
     return failure();
 
-  auto outTileInfo = getElementwiseTileShapeInfo(outType);
-  auto scaleTileInfo = getElementwiseTileShapeInfo(scaleType);
-  if (!outTileInfo || !scaleTileInfo || outTileInfo->dimExtents.empty())
-    return failure();
-  unsigned bcastDim = outTileInfo->dimExtents.size() - 1;
-  if (!hasSameRankTileShapeBroadcastingDim(
-          scaleTileInfo->dimExtents, outTileInfo->dimExtents, bcastDim))
-    return failure();
-
-  int64_t cols = outTileInfo->dimExtents.back();
-  if (cols <= 0 || outTileInfo->totalTiles % cols != 0)
-    return failure();
-  int64_t rows = outTileInfo->totalTiles / cols;
-  if (rows <= 0 || scaleTileInfo->totalTiles != rows)
+  if (failed(analyzeMulBcastColsShape(op, /*accInputIdx=*/1,
+                                      /*scaleInputIdx=*/2, analysis)))
     return failure();
 
   auto yieldOp = dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
@@ -1006,16 +1064,55 @@ static LogicalResult analyzeFusedMulBcastAddGeneric(
   if (!bodyHasOnlyOps(op, expectedOps))
     return failure();
 
-  analysis.rows = rows;
-  analysis.cols = cols;
-  analysis.outTiles = outTileInfo->totalTiles;
-  analysis.scaleTiles = scaleTileInfo->totalTiles;
   return success();
 }
 
 static bool isSupportedFusedMulBcastAddGeneric(linalg::GenericOp op) {
   FusedMulBcastAddAnalysis analysis;
   return succeeded(analyzeFusedMulBcastAddGeneric(op, analysis));
+}
+
+static LogicalResult analyzeInplaceMulBcastColsGeneric(
+    linalg::GenericOp op, FusedMulBcastAddAnalysis &analysis) {
+  if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 ||
+      !isAllParallelGeneric(op))
+    return failure();
+
+  unsigned rank = op.getNumLoops();
+  auto maps = op.getIndexingMapsArray();
+  if (maps.size() != 3)
+    return failure();
+  if (!isIdentityMapForRank(maps[0], rank) ||
+      !isSameRankLastDimZeroBroadcastMap(maps[1], rank) ||
+      !isIdentityMapForRank(maps[2], rank))
+    return failure();
+
+  if (op.getDpsInputs()[0] != op.getDpsInits()[0])
+    return failure();
+
+  if (failed(analyzeMulBcastColsShape(op, /*accInputIdx=*/0,
+                                      /*scaleInputIdx=*/1, analysis)))
+    return failure();
+
+  auto yieldOp = dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
+  if (!yieldOp || yieldOp.getValues().size() != 1)
+    return failure();
+
+  auto mulOp = yieldOp.getValues().front().getDefiningOp<arith::MulFOp>();
+  if (!mulOp || mulOp->getBlock() != &op.getRegion().front() ||
+      !matchMulOperands(op, mulOp, /*lhsIdx=*/0, /*rhsIdx=*/1))
+    return failure();
+
+  SmallVector<Operation *, 1> expectedOps{mulOp.getOperation()};
+  if (!bodyHasOnlyOps(op, expectedOps))
+    return failure();
+
+  return success();
+}
+
+static bool isSupportedInplaceMulBcastColsGeneric(linalg::GenericOp op) {
+  FusedMulBcastAddAnalysis analysis;
+  return succeeded(analyzeInplaceMulBcastColsGeneric(op, analysis));
 }
 
 static std::optional<int64_t> getTileDim(ShapedType type, unsigned dim) {
@@ -2275,6 +2372,33 @@ static Value resolveSimpleBinaryOperand(const SimpleBinaryTileAnalysis &analysis
   return inputCbs[operand.inputIdx];
 }
 
+static void emitSimpleBinaryTileUnaryInit(ConversionPatternRewriter &rewriter,
+                                          Location loc,
+                                          SimpleBinaryTileUnaryKind kind) {
+  switch (kind) {
+  case SimpleBinaryTileUnaryKind::Exp:
+    rewriter.create<ExpTileInitOp>(loc);
+    return;
+  case SimpleBinaryTileUnaryKind::Log:
+    rewriter.create<LogTileInitOp>(loc);
+    return;
+  }
+}
+
+static void emitSimpleBinaryTileUnaryOp(ConversionPatternRewriter &rewriter,
+                                        Location loc,
+                                        SimpleBinaryTileUnaryKind kind,
+                                        Value dstReg) {
+  switch (kind) {
+  case SimpleBinaryTileUnaryKind::Exp:
+    rewriter.create<ExpTileOp>(loc, dstReg);
+    return;
+  case SimpleBinaryTileUnaryKind::Log:
+    rewriter.create<LogTileOp>(loc, dstReg);
+    return;
+  }
+}
+
 static LogicalResult rewriteSimpleBinaryTileGeneric(
     linalg::GenericOp op, linalg::GenericOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter,
@@ -2315,6 +2439,9 @@ static LogicalResult rewriteSimpleBinaryTileGeneric(
     CBReserveBackOp::create(rewriter, loc, outCb,
                             i32Const(rewriter, loc, analysis.outTiles));
 
+  if (!analysis.unaryTail.empty())
+    rewriter.create<InitSFPUOp>(loc, lhsCb, outCb);
+
   switch (analysis.kind) {
   case SimpleBinaryTileKind::Add:
     rewriter.create<AddTilesInitOp>(loc, lhsCb, rhsCb);
@@ -2326,6 +2453,8 @@ static LogicalResult rewriteSimpleBinaryTileGeneric(
     rewriter.create<SubTilesInitOp>(loc, lhsCb, rhsCb);
     break;
   }
+  for (SimpleBinaryTileUnaryKind kind : analysis.unaryTail)
+    emitSimpleBinaryTileUnaryInit(rewriter, loc, kind);
 
   LogicalResult result = emitElementwiseTiles(
       rewriter, loc, outCb, analysis.outTiles, [&](Value tileIdx) {
@@ -2344,6 +2473,8 @@ static LogicalResult rewriteSimpleBinaryTileGeneric(
                              zeroI32);
           break;
         }
+        for (SimpleBinaryTileUnaryKind kind : analysis.unaryTail)
+          emitSimpleBinaryTileUnaryOp(rewriter, loc, kind, zeroI32);
         return success();
       });
   if (failed(result))
@@ -2447,6 +2578,32 @@ static LogicalResult emitMulBlockBcastColsInplace(
 
   waitState[accCb] = 0;
   waitState[scaleCb] = analysis.scaleTiles;
+  return success();
+}
+
+static LogicalResult rewriteInplaceMulBcastColsGeneric(
+    linalg::GenericOp op, linalg::GenericOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter,
+    llvm::DenseMap<Value, int64_t> &waitState) {
+  if (adaptor.getInputs().size() != 2 || adaptor.getOutputs().size() != 1)
+    return failure();
+
+  FusedMulBcastAddAnalysis analysis;
+  if (failed(analyzeInplaceMulBcastColsGeneric(op, analysis)))
+    return failure();
+
+  Value accCb = stripBroadcastBridgeCast(adaptor.getInputs()[0]);
+  Value scaleCb = stripBroadcastBridgeCast(adaptor.getInputs()[1]);
+  Value outCb = adaptor.getOutputs()[0];
+  if (!isa<CBType>(accCb.getType()) || !isa<CBType>(scaleCb.getType()) ||
+      !isa<CBType>(outCb.getType()) || accCb != outCb)
+    return failure();
+
+  if (failed(emitMulBlockBcastColsInplace(rewriter, op.getLoc(), accCb, scaleCb,
+                                          analysis, waitState)))
+    return failure();
+
+  rewriter.eraseOp(op);
   return success();
 }
 
@@ -3990,6 +4147,9 @@ public:
       return rewriteReduceGeneric(op, adaptor, rewriter, waitState);
     case FlashAttentionGenericKind::FusedMulBcastAdd:
       return rewriteFusedMulBcastAddGeneric(op, adaptor, rewriter, waitState);
+    case FlashAttentionGenericKind::InplaceMulBcastCols:
+      return rewriteInplaceMulBcastColsGeneric(op, adaptor, rewriter,
+                                               waitState);
     case FlashAttentionGenericKind::SimpleBinaryTile:
       return rewriteSimpleBinaryTileGeneric(op, adaptor, rewriter, waitState);
     case FlashAttentionGenericKind::Elementwise:

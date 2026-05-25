@@ -86,6 +86,22 @@ def is_flash_attention_section(lines, section_name=None):
     return False
 
 
+def replace_second_flash_attention_exp_templates(lines):
+    seen = {"exp_tile_init": 0, "exp_tile": 0}
+
+    def repl(match):
+        name = match.group(1)
+        seen[name] += 1
+        if seen[name] == 2:
+            return f"{name}<true,{match.group(2)}false>"
+        return match.group(0)
+
+    return [
+        re.sub(r"\b(exp_tile_init|exp_tile)<true,(\s*)true>", repl, line)
+        for line in lines
+    ]
+
+
 def insert_compute_trace_markers(lines):
     """
     Insert DPRINT markers before cb_wait_front calls.
@@ -801,12 +817,7 @@ def process_source_content(lines, section_name=None):
         processed = [i.replace("exp_tile(", "exp_tile<true, true>(").replace("exp_tile_init(", "exp_tile_init<true, true>(") for i in processed]
         # TMP: FlashAttention exp lowering currently needs these template flags off.
         if is_flash_attention_section(lines, section_name):
-            processed = [
-                i.replace("<true, true>", "<false, false>").replace(
-                    "<true,true>", "<false,false>"
-                )
-                for i in processed
-            ]
+            processed = replace_second_flash_attention_exp_templates(processed)
 
         processed, compaction_usage = _compact_compute_blocks(processed)
         if any(compaction_usage.values()):
