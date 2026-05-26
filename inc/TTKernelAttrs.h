@@ -41,6 +41,8 @@ inline constexpr llvm::StringLiteral kVecTilesAttrName =
     "loom.ttkernel.vec_tiles";
 inline constexpr llvm::StringLiteral kBroadcastDimAttrName =
     "loom.ttkernel.broadcast_dim";
+inline constexpr llvm::StringLiteral kFusedBcastColsAttrName =
+    "loom.ttkernel.fused_bcast_cols";
 inline constexpr llvm::StringLiteral kSemaphoreSlotAttrName =
     "loom.ttkernel.semaphore_slot";
 inline constexpr llvm::StringLiteral kCopyBindingSlotAttrName =

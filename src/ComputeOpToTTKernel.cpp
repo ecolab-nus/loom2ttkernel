@@ -58,7 +58,7 @@ namespace {
 enum class FlashAttentionGenericKind {
   Reduction,
   FusedMulBcastAdd,
-  InplaceMulBcastCols,
+  InplaceBinaryBcastCols,
   AddInplace,
   SimpleBinaryTile,
   Elementwise
@@ -295,7 +295,7 @@ static bool isSupportedElementwiseGeneric(linalg::GenericOp op) {
 }
 
 static bool isSupportedFusedMulBcastAddGeneric(linalg::GenericOp op);
-static bool isSupportedInplaceMulBcastColsGeneric(linalg::GenericOp op);
+static bool isSupportedInplaceBinaryBcastColsGeneric(linalg::GenericOp op);
 static bool isSupportedAddInplaceGeneric(linalg::GenericOp op);
 static bool isSupportedSimpleBinaryTileGeneric(linalg::GenericOp op);
 
@@ -320,8 +320,8 @@ classifyFlashAttentionGeneric(linalg::GenericOp op) {
   if (isSupportedFusedMulBcastAddGeneric(op))
     return FlashAttentionGenericKind::FusedMulBcastAdd;
 
-  if (isSupportedInplaceMulBcastColsGeneric(op))
-    return FlashAttentionGenericKind::InplaceMulBcastCols;
+  if (isSupportedInplaceBinaryBcastColsGeneric(op))
+    return FlashAttentionGenericKind::InplaceBinaryBcastCols;
 
   if (isSupportedAddInplaceGeneric(op))
     return FlashAttentionGenericKind::AddInplace;
@@ -692,35 +692,15 @@ struct SimpleBinaryTileAnalysis {
   int64_t outTiles = 0;
 };
 
-static LogicalResult analyzeSimpleBinaryTileGeneric(
-    linalg::GenericOp op, SimpleBinaryTileAnalysis &analysis) {
-  if (op.getNumDpsInits() != 1 || !isAllParallelGeneric(op))
-    return failure();
+struct SimpleBinaryExprAnalysis {
+  SimpleBinaryTileKind kind = SimpleBinaryTileKind::Add;
+  Value lhs;
+  Value rhs;
+  SmallVector<SimpleBinaryTileUnaryKind, 2> unaryTail;
+};
 
-  unsigned rank = op.getNumLoops();
-  auto maps = op.getIndexingMapsArray();
-  if (maps.size() != static_cast<size_t>(op.getNumDpsInputs() + 1))
-    return failure();
-  if (!isIdentityMapForRank(maps.back(), rank))
-    return failure();
-
-  auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
-  if (!outType || !outType.hasStaticShape() || outType.getRank() != rank)
-    return failure();
-
-  auto outTiles = getNumTilesFromShapedType(outType);
-  if (!outTiles || *outTiles <= 0)
-    return failure();
-
-  for (unsigned i = 0; i < op.getNumDpsInputs(); ++i) {
-    if (!isIdentityMapForRank(maps[i], rank))
-      return failure();
-    auto inputType = dyn_cast<ShapedType>(op.getDpsInputs()[i].getType());
-    if (!inputType || !inputType.hasStaticShape() ||
-        inputType.getShape() != outType.getShape())
-      return failure();
-  }
-
+static LogicalResult analyzeSimpleBinaryExpr(
+    linalg::GenericOp op, SimpleBinaryExprAnalysis &analysis) {
   auto yieldOp = dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
   if (!yieldOp || yieldOp.getValues().size() != 1)
     return failure();
@@ -756,33 +736,69 @@ static LogicalResult analyzeSimpleBinaryTileGeneric(
   if (!bodyHasOnlyOps(op, expectedOps))
     return failure();
 
-  Value lhs;
-  Value rhs;
   if (auto addOp = dyn_cast<arith::AddFOp>(defOp)) {
     analysis.kind = SimpleBinaryTileKind::Add;
-    lhs = addOp.getLhs();
-    rhs = addOp.getRhs();
+    analysis.lhs = addOp.getLhs();
+    analysis.rhs = addOp.getRhs();
   } else if (auto mulOp = dyn_cast<arith::MulFOp>(defOp)) {
     analysis.kind = SimpleBinaryTileKind::Mul;
-    lhs = mulOp.getLhs();
-    rhs = mulOp.getRhs();
+    analysis.lhs = mulOp.getLhs();
+    analysis.rhs = mulOp.getRhs();
   } else if (auto subOp = dyn_cast<arith::SubFOp>(defOp)) {
     analysis.kind = SimpleBinaryTileKind::Sub;
-    lhs = subOp.getLhs();
-    rhs = subOp.getRhs();
+    analysis.lhs = subOp.getLhs();
+    analysis.rhs = subOp.getRhs();
   } else {
     return failure();
   }
 
-  auto lhsOperand = getGenericBodyTileOperand(op, lhs);
-  auto rhsOperand = getGenericBodyTileOperand(op, rhs);
+  std::reverse(unaryTail.begin(), unaryTail.end());
+  analysis.unaryTail = std::move(unaryTail);
+  return success();
+}
+
+static LogicalResult analyzeSimpleBinaryTileGeneric(
+    linalg::GenericOp op, SimpleBinaryTileAnalysis &analysis) {
+  if (op.getNumDpsInits() != 1 || !isAllParallelGeneric(op))
+    return failure();
+
+  unsigned rank = op.getNumLoops();
+  auto maps = op.getIndexingMapsArray();
+  if (maps.size() != static_cast<size_t>(op.getNumDpsInputs() + 1))
+    return failure();
+  if (!isIdentityMapForRank(maps.back(), rank))
+    return failure();
+
+  auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
+  if (!outType || !outType.hasStaticShape() || outType.getRank() != rank)
+    return failure();
+
+  auto outTiles = getNumTilesFromShapedType(outType);
+  if (!outTiles || *outTiles <= 0)
+    return failure();
+
+  for (unsigned i = 0; i < op.getNumDpsInputs(); ++i) {
+    if (!isIdentityMapForRank(maps[i], rank))
+      return failure();
+    auto inputType = dyn_cast<ShapedType>(op.getDpsInputs()[i].getType());
+    if (!inputType || !inputType.hasStaticShape() ||
+        inputType.getShape() != outType.getShape())
+      return failure();
+  }
+
+  SimpleBinaryExprAnalysis expr;
+  if (failed(analyzeSimpleBinaryExpr(op, expr)))
+    return failure();
+
+  auto lhsOperand = getGenericBodyTileOperand(op, expr.lhs);
+  auto rhsOperand = getGenericBodyTileOperand(op, expr.rhs);
   if (!lhsOperand || !rhsOperand)
     return failure();
 
+  analysis.kind = expr.kind;
   analysis.lhs = *lhsOperand;
   analysis.rhs = *rhsOperand;
-  std::reverse(unaryTail.begin(), unaryTail.end());
-  analysis.unaryTail = std::move(unaryTail);
+  analysis.unaryTail = std::move(expr.unaryTail);
   analysis.outTiles = *outTiles;
   return success();
 }
@@ -1035,11 +1051,34 @@ static bool hasSameRankTileShapeBroadcastingDim(
   return true;
 }
 
+struct BcastColsShape {
+  int64_t rows = 0;
+  int64_t cols = 0;
+  int64_t outTiles = 0;
+  int64_t bcastTiles = 0;
+};
+
 struct FusedMulBcastAddAnalysis {
   int64_t rows = 0;
   int64_t cols = 0;
   int64_t outTiles = 0;
   int64_t scaleTiles = 0;
+};
+
+enum class BcastColsInputKind {
+  IndexedMap,
+  ExplicitBroadcast
+};
+
+struct InplaceBinaryBcastColsAnalysis {
+  SimpleBinaryTileKind kind = SimpleBinaryTileKind::Mul;
+  BcastColsInputKind inputKind = BcastColsInputKind::IndexedMap;
+  unsigned fullInputIdx = 0;
+  unsigned bcastInputIdx = 1;
+  BcastColsShape shape;
+  SmallVector<SimpleBinaryTileUnaryKind, 2> unaryTail;
+  ::loom::BroadcastOp broadcastOp;
+  ::loom::SemaphoreGiveOp giveOp;
 };
 
 static bool matchInputBlockArg(linalg::GenericOp op, Value value,
@@ -1056,6 +1095,41 @@ static bool matchMulOperands(linalg::GenericOp op, arith::MulFOp mulOp,
           matchInputBlockArg(op, mulOp.getRhs(), lhsIdx));
 }
 
+static LogicalResult analyzeBcastColsShape(ShapedType outType,
+                                           ShapedType fullType,
+                                           ShapedType bcastType,
+                                           BcastColsShape &shape) {
+  if (!outType || !fullType || !bcastType || !outType.hasStaticShape() ||
+      !fullType.hasStaticShape() || !bcastType.hasStaticShape() ||
+      fullType.getShape() != outType.getShape() ||
+      bcastType.getRank() != outType.getRank() || outType.getRank() == 0)
+    return failure();
+
+  auto outTileInfo = getElementwiseTileShapeInfo(outType);
+  auto bcastTileInfo = getElementwiseTileShapeInfo(bcastType);
+  if (!outTileInfo || !bcastTileInfo || outTileInfo->dimExtents.empty())
+    return failure();
+
+  unsigned bcastDim = outTileInfo->dimExtents.size() - 1;
+  if (!hasSameRankTileShapeBroadcastingDim(
+          bcastTileInfo->dimExtents, outTileInfo->dimExtents, bcastDim))
+    return failure();
+
+  int64_t cols = outTileInfo->dimExtents.back();
+  if (cols <= 0 || outTileInfo->totalTiles % cols != 0)
+    return failure();
+
+  int64_t rows = outTileInfo->totalTiles / cols;
+  if (rows <= 0 || bcastTileInfo->totalTiles != rows)
+    return failure();
+
+  shape.rows = rows;
+  shape.cols = cols;
+  shape.outTiles = outTileInfo->totalTiles;
+  shape.bcastTiles = bcastTileInfo->totalTiles;
+  return success();
+}
+
 static LogicalResult analyzeMulBcastColsShape(
     linalg::GenericOp op, unsigned accInputIdx, unsigned scaleInputIdx,
     FusedMulBcastAddAnalysis &analysis) {
@@ -1067,32 +1141,14 @@ static LogicalResult analyzeMulBcastColsShape(
   auto accType = dyn_cast<ShapedType>(op.getDpsInputs()[accInputIdx].getType());
   auto scaleType =
       dyn_cast<ShapedType>(op.getDpsInputs()[scaleInputIdx].getType());
-  if (!outType || !accType || !scaleType || !outType.hasStaticShape() ||
-      !accType.hasStaticShape() || !scaleType.hasStaticShape() ||
-      accType.getShape() != outType.getShape() ||
-      scaleType.getRank() != outType.getRank())
+  BcastColsShape shape;
+  if (failed(analyzeBcastColsShape(outType, accType, scaleType, shape)))
     return failure();
 
-  auto outTileInfo = getElementwiseTileShapeInfo(outType);
-  auto scaleTileInfo = getElementwiseTileShapeInfo(scaleType);
-  if (!outTileInfo || !scaleTileInfo || outTileInfo->dimExtents.empty())
-    return failure();
-  unsigned bcastDim = outTileInfo->dimExtents.size() - 1;
-  if (!hasSameRankTileShapeBroadcastingDim(
-          scaleTileInfo->dimExtents, outTileInfo->dimExtents, bcastDim))
-    return failure();
-
-  int64_t cols = outTileInfo->dimExtents.back();
-  if (cols <= 0 || outTileInfo->totalTiles % cols != 0)
-    return failure();
-  int64_t rows = outTileInfo->totalTiles / cols;
-  if (rows <= 0 || scaleTileInfo->totalTiles != rows)
-    return failure();
-
-  analysis.rows = rows;
-  analysis.cols = cols;
-  analysis.outTiles = outTileInfo->totalTiles;
-  analysis.scaleTiles = scaleTileInfo->totalTiles;
+  analysis.rows = shape.rows;
+  analysis.cols = shape.cols;
+  analysis.outTiles = shape.outTiles;
+  analysis.scaleTiles = shape.bcastTiles;
   return success();
 }
 
@@ -1160,47 +1216,177 @@ static bool isSupportedFusedMulBcastAddGeneric(linalg::GenericOp op) {
   return succeeded(analyzeFusedMulBcastAddGeneric(op, analysis));
 }
 
-static LogicalResult analyzeInplaceMulBcastColsGeneric(
-    linalg::GenericOp op, FusedMulBcastAddAnalysis &analysis) {
+static bool broadcastResultUsedOnlyBy(::loom::BroadcastOp broadcastOp,
+                                      Operation *consumer) {
+  if (broadcastOp.getNumResults() != 1)
+    return false;
+
+  bool sawUse = false;
+  for (OpOperand &use : broadcastOp->getResult(0).getUses()) {
+    if (use.getOwner() != consumer)
+      return false;
+    sawUse = true;
+  }
+  return sawUse;
+}
+
+static bool hasOnlyBroadcastAndGiveUses(Value temp,
+                                        ::loom::BroadcastOp broadcastOp,
+                                        ::loom::SemaphoreGiveOp giveOp) {
+  for (OpOperand &use : temp.getUses()) {
+    Operation *owner = use.getOwner();
+    if (owner != broadcastOp.getOperation() && owner != giveOp.getOperation())
+      return false;
+  }
+  return true;
+}
+
+static ::loom::SemaphoreGiveOp
+getAdjacentBroadcastTempGive(linalg::GenericOp op,
+                             ::loom::BroadcastOp broadcastOp) {
+  auto giveOp =
+      dyn_cast_or_null<::loom::SemaphoreGiveOp>(op->getNextNode());
+  if (!giveOp)
+    return {};
+
+  if (stripMemrefCasts(giveOp.getSource()) !=
+      stripMemrefCasts(broadcastOp.getInit()))
+    return {};
+
+  return giveOp;
+}
+
+static LogicalResult analyzeInplaceBinaryBcastColsGeneric(
+    linalg::GenericOp op, InplaceBinaryBcastColsAnalysis &analysis) {
   if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 ||
       !isAllParallelGeneric(op))
     return failure();
 
   unsigned rank = op.getNumLoops();
   auto maps = op.getIndexingMapsArray();
-  if (maps.size() != 3)
-    return failure();
-  if (!isIdentityMapForRank(maps[0], rank) ||
-      !isSameRankLastDimZeroBroadcastMap(maps[1], rank) ||
+  if (rank == 0 || maps.size() != 3 ||
       !isIdentityMapForRank(maps[2], rank))
     return failure();
 
-  if (op.getDpsInputs()[0] != op.getDpsInits()[0])
+  auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
+  if (!outType || !outType.hasStaticShape() || outType.getRank() != rank)
     return failure();
 
-  if (failed(analyzeMulBcastColsShape(op, /*accInputIdx=*/0,
-                                      /*scaleInputIdx=*/1, analysis)))
+  std::optional<unsigned> fullInputIdx;
+  std::optional<unsigned> bcastInputIdx;
+  BcastColsInputKind inputKind = BcastColsInputKind::IndexedMap;
+  ShapedType bcastType;
+  ::loom::BroadcastOp broadcastOp;
+  ::loom::SemaphoreGiveOp giveOp;
+
+  if (isIdentityMapForRank(maps[0], rank) &&
+      isSameRankLastDimZeroBroadcastMap(maps[1], rank)) {
+    if (op.getDpsInputs()[0] != op.getDpsInits()[0])
+      return failure();
+    fullInputIdx = 0;
+    bcastInputIdx = 1;
+    bcastType = dyn_cast<ShapedType>(op.getDpsInputs()[1].getType());
+  } else if (isIdentityMapForRank(maps[0], rank) &&
+             isIdentityMapForRank(maps[1], rank)) {
+    inputKind = BcastColsInputKind::ExplicitBroadcast;
+
+    for (unsigned i = 0; i < op.getNumDpsInputs(); ++i) {
+      if (op.getDpsInputs()[i] == op.getDpsInits()[0]) {
+        fullInputIdx = i;
+        continue;
+      }
+      if (op.getDpsInputs()[i].getDefiningOp<::loom::BroadcastOp>())
+        bcastInputIdx = i;
+    }
+    if (!fullInputIdx || !bcastInputIdx || *fullInputIdx == *bcastInputIdx)
+      return failure();
+
+    broadcastOp =
+        op.getDpsInputs()[*bcastInputIdx].getDefiningOp<::loom::BroadcastOp>();
+    if (!broadcastOp || broadcastOp->getBlock() != op->getBlock() ||
+        broadcastOp->getNextNode() != op.getOperation() ||
+        broadcastOp.getNumResults() != 1 ||
+        broadcastOp->getResult(0) != op.getDpsInputs()[*bcastInputIdx] ||
+        broadcastOp.getDim() != static_cast<int64_t>(rank - 1))
+      return failure();
+
+    giveOp = getAdjacentBroadcastTempGive(op, broadcastOp);
+    if (!giveOp || !broadcastResultUsedOnlyBy(broadcastOp, op.getOperation()) ||
+        !hasOnlyBroadcastAndGiveUses(broadcastOp.getInit(), broadcastOp, giveOp))
+      return failure();
+
+    auto bcastInitType = dyn_cast<ShapedType>(broadcastOp.getInit().getType());
+    if (!bcastInitType || !bcastInitType.hasStaticShape() ||
+        bcastInitType.getShape() != outType.getShape())
+      return failure();
+
+    bcastType = dyn_cast<ShapedType>(broadcastOp.getIns().getType());
+  } else {
+    return failure();
+  }
+
+  auto fullType =
+      dyn_cast<ShapedType>(op.getDpsInputs()[*fullInputIdx].getType());
+  BcastColsShape shape;
+  if (failed(analyzeBcastColsShape(outType, fullType, bcastType, shape)))
     return failure();
 
-  auto yieldOp = dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
-  if (!yieldOp || yieldOp.getValues().size() != 1)
+  SimpleBinaryExprAnalysis expr;
+  if (failed(analyzeSimpleBinaryExpr(op, expr)) ||
+      expr.kind == SimpleBinaryTileKind::Add)
     return failure();
 
-  auto mulOp = yieldOp.getValues().front().getDefiningOp<arith::MulFOp>();
-  if (!mulOp || mulOp->getBlock() != &op.getRegion().front() ||
-      !matchMulOperands(op, mulOp, /*lhsIdx=*/0, /*rhsIdx=*/1))
+  auto lhs = getGenericBodyTileOperand(op, expr.lhs);
+  auto rhs = getGenericBodyTileOperand(op, expr.rhs);
+  if (!lhs || !rhs || lhs->isOutput || rhs->isOutput)
     return failure();
 
-  SmallVector<Operation *, 1> expectedOps{mulOp.getOperation()};
-  if (!bodyHasOnlyOps(op, expectedOps))
+  bool usesFullAndBcast =
+      ((lhs->inputIdx == *fullInputIdx && rhs->inputIdx == *bcastInputIdx) ||
+       (lhs->inputIdx == *bcastInputIdx && rhs->inputIdx == *fullInputIdx));
+  if (inputKind == BcastColsInputKind::IndexedMap &&
+      (expr.kind != SimpleBinaryTileKind::Mul || !expr.unaryTail.empty()))
     return failure();
 
+  if (expr.kind == SimpleBinaryTileKind::Mul) {
+    if (!usesFullAndBcast)
+      return failure();
+  } else if (expr.kind == SimpleBinaryTileKind::Sub) {
+    if (lhs->inputIdx != *fullInputIdx || rhs->inputIdx != *bcastInputIdx)
+      return failure();
+  } else {
+    return failure();
+  }
+
+  analysis.kind = expr.kind;
+  analysis.inputKind = inputKind;
+  analysis.fullInputIdx = *fullInputIdx;
+  analysis.bcastInputIdx = *bcastInputIdx;
+  analysis.shape = shape;
+  analysis.unaryTail = std::move(expr.unaryTail);
+  analysis.broadcastOp = broadcastOp;
+  analysis.giveOp = giveOp;
   return success();
 }
 
-static bool isSupportedInplaceMulBcastColsGeneric(linalg::GenericOp op) {
-  FusedMulBcastAddAnalysis analysis;
-  return succeeded(analyzeInplaceMulBcastColsGeneric(op, analysis));
+static bool isSupportedInplaceBinaryBcastColsGeneric(linalg::GenericOp op) {
+  InplaceBinaryBcastColsAnalysis analysis;
+  return succeeded(analyzeInplaceBinaryBcastColsGeneric(op, analysis));
+}
+
+static ::loom::SemaphoreGiveOp
+getInplaceBinaryBcastColsGiveForBroadcast(::loom::BroadcastOp broadcastOp) {
+  auto genericOp =
+      dyn_cast_or_null<linalg::GenericOp>(broadcastOp->getNextNode());
+  if (!genericOp)
+    return {};
+
+  InplaceBinaryBcastColsAnalysis analysis;
+  if (failed(analyzeInplaceBinaryBcastColsGeneric(genericOp, analysis)) ||
+      analysis.broadcastOp != broadcastOp)
+    return {};
+
+  return analysis.giveOp;
 }
 
 static std::optional<int64_t> getTileDim(ShapedType type, unsigned dim) {
@@ -2651,26 +2837,46 @@ static void emitOpaqueCall(ConversionPatternRewriter &rewriter, Location loc,
                                        nullptr, args);
 }
 
-static LogicalResult emitMulBlockBcastColsInplace(
+static LogicalResult emitBinaryBlockBcastColsInplace(
     ConversionPatternRewriter &rewriter, Location loc, Value accCb,
-    Value scaleCb, const FusedMulBcastAddAnalysis &analysis,
+    Value bcastCb, const BcastColsShape &shape, SimpleBinaryTileKind kind,
+    ArrayRef<SimpleBinaryTileUnaryKind> unaryTail,
     llvm::DenseMap<Value, int64_t> &waitState) {
   FailureOr<Value> accLiteral = createEmitCCBLiteral(rewriter, loc, accCb);
-  FailureOr<Value> scaleLiteral = createEmitCCBLiteral(rewriter, loc, scaleCb);
-  if (failed(accLiteral) || failed(scaleLiteral))
+  FailureOr<Value> bcastLiteral = createEmitCCBLiteral(rewriter, loc, bcastCb);
+  if (failed(accLiteral) || failed(bcastLiteral))
     return failure();
 
-  emitOpaqueCall(rewriter, loc, "mul_bcast_cols_init_short",
-                 ValueRange{*accLiteral, *scaleLiteral});
-  emitWaitFrontIfNeeded(rewriter, loc, accCb, analysis.outTiles, waitState);
-  emitWaitFrontIfNeeded(rewriter, loc, scaleCb, analysis.scaleTiles, waitState);
+  StringRef initCallee;
+  StringRef tileCallee;
+  switch (kind) {
+  case SimpleBinaryTileKind::Mul:
+    initCallee = "mul_bcast_cols_init_short";
+    tileCallee = "mul_tiles_bcast_cols";
+    break;
+  case SimpleBinaryTileKind::Sub:
+    initCallee = "sub_bcast_cols_init_short";
+    tileCallee = "sub_tiles_bcast_cols";
+    break;
+  case SimpleBinaryTileKind::Add:
+    return failure();
+  }
+
+  if (!unaryTail.empty())
+    rewriter.create<InitSFPUOp>(loc, accCb, accCb);
+  emitOpaqueCall(rewriter, loc, initCallee,
+                 ValueRange{*accLiteral, *bcastLiteral});
+  for (SimpleBinaryTileUnaryKind unaryKind : unaryTail)
+    emitSimpleBinaryTileUnaryInit(rewriter, loc, unaryKind);
+  emitWaitFrontIfNeeded(rewriter, loc, accCb, shape.outTiles, waitState);
+  emitWaitFrontIfNeeded(rewriter, loc, bcastCb, shape.bcastTiles, waitState);
 
   Value zeroI32 = i32Const(rewriter, loc, 0);
   Value oneI32 = i32Const(rewriter, loc, 1);
-  Value rowsV = i32Const(rewriter, loc, analysis.rows);
-  Value colsV = i32Const(rewriter, loc, analysis.cols);
+  Value rowsV = i32Const(rewriter, loc, shape.rows);
+  Value colsV = i32Const(rewriter, loc, shape.cols);
   Value dstTilesV =
-      i32Const(rewriter, loc, std::min<int64_t>(analysis.cols, 8));
+      i32Const(rewriter, loc, std::min<int64_t>(shape.cols, 8));
 
   scf::ForOp rowLoop =
       scf::ForOp::create(rewriter, loc, zeroI32, rowsV, oneI32);
@@ -2698,9 +2904,11 @@ static LogicalResult emitMulBlockBcastColsInplace(
         OpBuilder::InsertionGuard mulGuard(rewriter);
         rewriter.setInsertionPointToStart(mulLoop.getBody());
         Value dstIdx = mulLoop.getInductionVar();
-        emitOpaqueCall(rewriter, loc, "mul_tiles_bcast_cols",
-                       ValueRange{*accLiteral, *scaleLiteral, dstIdx, rowIdx,
+        emitOpaqueCall(rewriter, loc, tileCallee,
+                       ValueRange{*accLiteral, *bcastLiteral, dstIdx, rowIdx,
                                   dstIdx});
+        for (SimpleBinaryTileUnaryKind unaryKind : unaryTail)
+          emitSimpleBinaryTileUnaryOp(rewriter, loc, unaryKind, dstIdx);
       }
 
       rewriter.setInsertionPointAfter(mulLoop);
@@ -2725,32 +2933,61 @@ static LogicalResult emitMulBlockBcastColsInplace(
   }
 
   waitState[accCb] = 0;
-  waitState[scaleCb] = analysis.scaleTiles;
+  waitState[bcastCb] = shape.bcastTiles;
   return success();
 }
 
-static LogicalResult rewriteInplaceMulBcastColsGeneric(
+static LogicalResult emitMulBlockBcastColsInplace(
+    ConversionPatternRewriter &rewriter, Location loc, Value accCb,
+    Value scaleCb, const FusedMulBcastAddAnalysis &analysis,
+    llvm::DenseMap<Value, int64_t> &waitState) {
+  BcastColsShape shape;
+  shape.rows = analysis.rows;
+  shape.cols = analysis.cols;
+  shape.outTiles = analysis.outTiles;
+  shape.bcastTiles = analysis.scaleTiles;
+  return emitBinaryBlockBcastColsInplace(
+      rewriter, loc, accCb, scaleCb, shape, SimpleBinaryTileKind::Mul,
+      ArrayRef<SimpleBinaryTileUnaryKind>{}, waitState);
+}
+
+static LogicalResult rewriteInplaceBinaryBcastColsGeneric(
     linalg::GenericOp op, linalg::GenericOp::Adaptor adaptor,
     ConversionPatternRewriter &rewriter,
     llvm::DenseMap<Value, int64_t> &waitState) {
   if (adaptor.getInputs().size() != 2 || adaptor.getOutputs().size() != 1)
     return failure();
 
-  FusedMulBcastAddAnalysis analysis;
-  if (failed(analyzeInplaceMulBcastColsGeneric(op, analysis)))
+  InplaceBinaryBcastColsAnalysis analysis;
+  if (failed(analyzeInplaceBinaryBcastColsGeneric(op, analysis)))
     return failure();
 
-  Value accCb = stripBroadcastBridgeCast(adaptor.getInputs()[0]);
-  Value scaleCb = stripBroadcastBridgeCast(adaptor.getInputs()[1]);
+  Value accCb = stripBroadcastBridgeCast(adaptor.getInputs()[analysis.fullInputIdx]);
   Value outCb = adaptor.getOutputs()[0];
-  if (!isa<CBType>(accCb.getType()) || !isa<CBType>(scaleCb.getType()) ||
+  Value bcastCb;
+  if (analysis.inputKind == BcastColsInputKind::ExplicitBroadcast) {
+    bcastCb = rewriter.getRemappedValue(analysis.broadcastOp.getIns());
+    if (!bcastCb)
+      return failure();
+  } else {
+    bcastCb = adaptor.getInputs()[analysis.bcastInputIdx];
+  }
+  bcastCb = stripBroadcastBridgeCast(bcastCb);
+
+  if (!isa<CBType>(accCb.getType()) || !isa<CBType>(bcastCb.getType()) ||
       !isa<CBType>(outCb.getType()) || accCb != outCb)
     return failure();
 
-  if (failed(emitMulBlockBcastColsInplace(rewriter, op.getLoc(), accCb, scaleCb,
-                                          analysis, waitState)))
+  if (failed(emitBinaryBlockBcastColsInplace(
+          rewriter, op.getLoc(), accCb, bcastCb, analysis.shape, analysis.kind,
+          analysis.unaryTail, waitState)))
     return failure();
 
+  if (analysis.inputKind == BcastColsInputKind::ExplicitBroadcast) {
+    analysis.broadcastOp->setAttr(kFusedBcastColsAttrName,
+                                  rewriter.getUnitAttr());
+    analysis.giveOp->setAttr(kFusedBcastColsAttrName, rewriter.getUnitAttr());
+  }
   rewriter.eraseOp(op);
   return success();
 }
@@ -4170,6 +4407,17 @@ public:
       return failure();
     ComputeBroadcastPlan plan = *planOr;
 
+    if (op->hasAttr(kFusedBcastColsAttrName)) {
+      return replaceLoomBroadcastOp(op, outCb, plan, rewriter,
+                                    *getTypeConverter());
+    }
+    if (auto giveOp = getInplaceBinaryBcastColsGiveForBroadcast(op)) {
+      op->setAttr(kFusedBcastColsAttrName, rewriter.getUnitAttr());
+      giveOp->setAttr(kFusedBcastColsAttrName, rewriter.getUnitAttr());
+      return replaceLoomBroadcastOp(op, outCb, plan, rewriter,
+                                    *getTypeConverter());
+    }
+
     if (inCb == outCb) {
       if (plan.materializesFullOutput)
         return op.emitOpError()
@@ -4295,9 +4543,9 @@ public:
       return rewriteReduceGeneric(op, adaptor, rewriter, waitState);
     case FlashAttentionGenericKind::FusedMulBcastAdd:
       return rewriteFusedMulBcastAddGeneric(op, adaptor, rewriter, waitState);
-    case FlashAttentionGenericKind::InplaceMulBcastCols:
-      return rewriteInplaceMulBcastColsGeneric(op, adaptor, rewriter,
-                                               waitState);
+    case FlashAttentionGenericKind::InplaceBinaryBcastCols:
+      return rewriteInplaceBinaryBcastColsGeneric(op, adaptor, rewriter,
+                                                  waitState);
     case FlashAttentionGenericKind::AddInplace:
       return rewriteAddInplaceGeneric(op, adaptor, rewriter, waitState);
     case FlashAttentionGenericKind::SimpleBinaryTile:

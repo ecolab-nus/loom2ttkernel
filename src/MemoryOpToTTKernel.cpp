@@ -1260,6 +1260,11 @@ struct ConvertLoomSemaphoreGiveOp
   LogicalResult
   matchAndRewrite(::loom::SemaphoreGiveOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    if (op->hasAttr(kFusedBcastColsAttrName)) {
+      rewriter.eraseOp(op);
+      return success();
+    }
+
     // L1->DRAM stores are drained by writer kernels. The adjacent give is
     // only a liveness marker and must not lower to cb_pop_front in compute.
     if (isSemaphoreGiveForAdjacentL1ToDramStore(op)) {
