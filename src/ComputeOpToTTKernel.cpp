@@ -59,6 +59,7 @@ enum class FlashAttentionGenericKind {
   Reduction,
   FusedMulBcastAdd,
   InplaceMulBcastCols,
+  AddInplace,
   SimpleBinaryTile,
   Elementwise
 };
@@ -295,6 +296,7 @@ static bool isSupportedElementwiseGeneric(linalg::GenericOp op) {
 
 static bool isSupportedFusedMulBcastAddGeneric(linalg::GenericOp op);
 static bool isSupportedInplaceMulBcastColsGeneric(linalg::GenericOp op);
+static bool isSupportedAddInplaceGeneric(linalg::GenericOp op);
 static bool isSupportedSimpleBinaryTileGeneric(linalg::GenericOp op);
 
 template <typename OpTy>
@@ -320,6 +322,9 @@ classifyFlashAttentionGeneric(linalg::GenericOp op) {
 
   if (isSupportedInplaceMulBcastColsGeneric(op))
     return FlashAttentionGenericKind::InplaceMulBcastCols;
+
+  if (isSupportedAddInplaceGeneric(op))
+    return FlashAttentionGenericKind::AddInplace;
 
   if (isSupportedSimpleBinaryTileGeneric(op))
     return FlashAttentionGenericKind::SimpleBinaryTile;
@@ -785,6 +790,89 @@ static LogicalResult analyzeSimpleBinaryTileGeneric(
 static bool isSupportedSimpleBinaryTileGeneric(linalg::GenericOp op) {
   SimpleBinaryTileAnalysis analysis;
   return succeeded(analyzeSimpleBinaryTileGeneric(op, analysis));
+}
+
+struct AddInplaceAnalysis {
+  unsigned accInputIdx = 0;
+  unsigned addendInputIdx = 1;
+  int64_t outTiles = 0;
+};
+
+static LogicalResult analyzeAddInplaceGeneric(linalg::GenericOp op,
+                                              AddInplaceAnalysis &analysis) {
+  if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 ||
+      !isAllParallelGeneric(op))
+    return failure();
+
+  unsigned rank = op.getNumLoops();
+  auto maps = op.getIndexingMapsArray();
+  if (maps.size() != 3)
+    return failure();
+  if (!isIdentityMapForRank(maps[0], rank) ||
+      !isIdentityMapForRank(maps[1], rank) ||
+      !isIdentityMapForRank(maps[2], rank))
+    return failure();
+
+  auto outType = dyn_cast<ShapedType>(op.getDpsInits()[0].getType());
+  if (!outType || !outType.hasStaticShape() || outType.getRank() != rank)
+    return failure();
+
+  auto outTiles = getNumTilesFromShapedType(outType);
+  if (!outTiles || *outTiles <= 0)
+    return failure();
+
+  for (Value input : op.getDpsInputs()) {
+    auto inputType = dyn_cast<ShapedType>(input.getType());
+    if (!inputType || !inputType.hasStaticShape() ||
+        inputType.getShape() != outType.getShape())
+      return failure();
+  }
+
+  unsigned aliasCount = 0;
+  unsigned accInputIdx = 0;
+  for (unsigned i = 0; i < op.getNumDpsInputs(); ++i) {
+    if (op.getDpsInputs()[i] != op.getDpsInits()[0])
+      continue;
+    ++aliasCount;
+    accInputIdx = i;
+  }
+  if (aliasCount != 1)
+    return failure();
+
+  auto yieldOp = dyn_cast<linalg::YieldOp>(op.getRegion().front().getTerminator());
+  if (!yieldOp || yieldOp.getValues().size() != 1)
+    return failure();
+
+  auto addOp = yieldOp.getValues().front().getDefiningOp<arith::AddFOp>();
+  if (!addOp || addOp->getBlock() != &op.getRegion().front())
+    return failure();
+
+  SmallVector<Operation *, 1> expectedOps{addOp.getOperation()};
+  if (!bodyHasOnlyOps(op, expectedOps))
+    return failure();
+
+  auto lhs = getGenericBodyTileOperand(op, addOp.getLhs());
+  auto rhs = getGenericBodyTileOperand(op, addOp.getRhs());
+  if (!lhs || !rhs || lhs->isOutput || rhs->isOutput ||
+      lhs->inputIdx == rhs->inputIdx)
+    return failure();
+
+  unsigned addendInputIdx = accInputIdx == 0 ? 1 : 0;
+  bool usesAcc = lhs->inputIdx == accInputIdx || rhs->inputIdx == accInputIdx;
+  bool usesAddend =
+      lhs->inputIdx == addendInputIdx || rhs->inputIdx == addendInputIdx;
+  if (!usesAcc || !usesAddend)
+    return failure();
+
+  analysis.accInputIdx = accInputIdx;
+  analysis.addendInputIdx = addendInputIdx;
+  analysis.outTiles = *outTiles;
+  return success();
+}
+
+static bool isSupportedAddInplaceGeneric(linalg::GenericOp op) {
+  AddInplaceAnalysis analysis;
+  return succeeded(analyzeAddInplaceGeneric(op, analysis));
 }
 
 static std::optional<unsigned> getProducerBroadcastDim(Value value) {
@@ -2397,6 +2485,66 @@ static void emitSimpleBinaryTileUnaryOp(ConversionPatternRewriter &rewriter,
     rewriter.create<LogTileOp>(loc, dstReg);
     return;
   }
+}
+
+static LogicalResult rewriteAddInplaceGeneric(
+    linalg::GenericOp op, linalg::GenericOp::Adaptor adaptor,
+    ConversionPatternRewriter &rewriter,
+    llvm::DenseMap<Value, int64_t> &waitState) {
+  if (adaptor.getInputs().size() != 2 || adaptor.getOutputs().size() != 1)
+    return failure();
+
+  AddInplaceAnalysis analysis;
+  if (failed(analyzeAddInplaceGeneric(op, analysis)))
+    return failure();
+
+  Value outCb = adaptor.getOutputs()[0];
+  if (!isa<CBType>(outCb.getType()))
+    return failure();
+
+  SmallVector<Value, 2> inputCbs;
+  inputCbs.reserve(adaptor.getInputs().size());
+  for (Value inputCb : adaptor.getInputs()) {
+    Value effectiveInputCb = stripBroadcastBridgeCast(inputCb);
+    if (!isa<CBType>(effectiveInputCb.getType()))
+      return failure();
+    inputCbs.push_back(effectiveInputCb);
+  }
+
+  Value accCb = inputCbs[analysis.accInputIdx];
+  Value addendCb = inputCbs[analysis.addendInputIdx];
+  if (accCb != outCb)
+    return failure();
+
+  Location loc = op.getLoc();
+  emitWaitFrontIfNeeded(rewriter, loc, accCb, analysis.outTiles, waitState);
+  if (addendCb != accCb)
+    emitWaitFrontIfNeeded(rewriter, loc, addendCb, analysis.outTiles, waitState);
+
+  rewriter.create<CopyTileInitOp>(loc, addendCb);
+  emitPackReconfigDataFormat(rewriter, loc, accCb);
+  emitPackReconfigL1Acc(rewriter, loc, 1);
+
+  LogicalResult result =
+      emitElementwiseTiles(rewriter, loc, accCb, analysis.outTiles,
+                           [&](Value tileIdx) -> LogicalResult {
+                             Value zeroI32 = i32Const(rewriter, loc, 0);
+                             rewriter.create<CopyTileOp>(loc, addendCb, tileIdx,
+                                                         zeroI32);
+                             return success();
+                           });
+  if (failed(result))
+    return failure();
+
+  emitPackOverwriteMode(rewriter, loc, accCb);
+  Value outTilesV = i32Const(rewriter, loc, analysis.outTiles);
+  CBPopFrontOp::create(rewriter, loc, accCb, outTilesV);
+  CBReserveBackOp::create(rewriter, loc, accCb, outTilesV);
+  CBPushBackOp::create(rewriter, loc, accCb, outTilesV);
+  waitState[accCb] = 0;
+
+  rewriter.eraseOp(op);
+  return success();
 }
 
 static LogicalResult rewriteSimpleBinaryTileGeneric(
@@ -4150,6 +4298,8 @@ public:
     case FlashAttentionGenericKind::InplaceMulBcastCols:
       return rewriteInplaceMulBcastColsGeneric(op, adaptor, rewriter,
                                                waitState);
+    case FlashAttentionGenericKind::AddInplace:
+      return rewriteAddInplaceGeneric(op, adaptor, rewriter, waitState);
     case FlashAttentionGenericKind::SimpleBinaryTile:
       return rewriteSimpleBinaryTileGeneric(op, adaptor, rewriter, waitState);
     case FlashAttentionGenericKind::Elementwise:

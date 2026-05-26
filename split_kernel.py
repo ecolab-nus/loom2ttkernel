@@ -91,9 +91,12 @@ def replace_second_flash_attention_exp_templates(lines):
 
     def repl(match):
         name = match.group(1)
+        spacing = match.group(2)
         seen[name] += 1
         if seen[name] == 2:
-            return f"{name}<true,{match.group(2)}false>"
+            if name == "exp_tile":
+                return f"{name}<true,{spacing}false,{spacing}true,{spacing}true>"
+            return f"{name}<true,{spacing}false>"
         return match.group(0)
 
     return [
