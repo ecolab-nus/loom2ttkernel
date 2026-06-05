@@ -3627,7 +3627,8 @@ private:
     }
     emitLine("constexpr uint32_t single_tile_size = sizeof(bfloat16) * TILE_HEIGHT * TILE_WIDTH;");
     emitLine("const auto cb_data_format = tt::DataFormat::Float16_b;");
-    emitLine("uint32_t cb_buffer_depth = 2;");
+    emitLine("uint32_t cb_buffer_depth = " +
+             std::to_string(getInputCBBufferDepth()) + ";");
   }
 
   void emitDramBuffers() {
@@ -3820,6 +3821,10 @@ private:
                                 return offsetExpr.contains("core.");
                               });
                         });
+  }
+
+  int64_t getInputCBBufferDepth() const {
+    return originalFunc.getName().contains("is_double_buffer0") ? 1 : 2;
   }
 
   bool useSplitHalfDataMovementCores() const {

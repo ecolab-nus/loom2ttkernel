@@ -1190,6 +1190,19 @@ def _extract_host_ttnn_metadata(lines):
     wrapper_base = extract_marker_symbol(lines[0])
     if wrapper_base.endswith("__host_pybind"):
         wrapper_base = wrapper_base[: -len("__host_pybind")]
+    cb_buffer_depth = None
+    for line in lines:
+        match = re.search(
+            r"(?:const(?:expr)?\s+)?uint32_t\s+cb_buffer_depth\s*=\s*(\d+)(?:[uUlL]+)?\s*;",
+            line,
+        )
+        if match:
+            cb_buffer_depth = int(match.group(1))
+            break
+    if "is_double_buffer0" in wrapper_base:
+        cb_buffer_depth = 1
+    elif cb_buffer_depth is None:
+        cb_buffer_depth = 2
     mlir_core_extent_x, mlir_core_extent_y = _parse_wrapper_mesh_extents(wrapper_base)
     for line in lines:
         end_core_match = re.search(
@@ -1310,7 +1323,7 @@ def _extract_host_ttnn_metadata(lines):
         "TILE_HEIGHT": 32,
         "TILE_WIDTH": 32,
         "single_tile_size": 2 * 1024,
-        "cb_buffer_depth": 2,
+        "cb_buffer_depth": cb_buffer_depth,
     }
     for const_name, const_expr in cb_tile_exprs.items():
         symbol_values[const_name] = _safe_eval_u32_expr(const_expr, symbol_values)
