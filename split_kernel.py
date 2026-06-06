@@ -1806,6 +1806,20 @@ def _write_section_outputs(output_path, current_filename, current_section):
     return created_files
 
 
+def _unique_filename(filename, used_filenames):
+    if filename not in used_filenames:
+        return filename
+
+    stem = Path(filename).stem
+    ext = Path(filename).suffix
+    suffix = 2
+    candidate = f"{stem}_{suffix}{ext}"
+    while candidate in used_filenames:
+        suffix += 1
+        candidate = f"{stem}_{suffix}{ext}"
+    return candidate
+
+
 def extract_function_name(comment_line):
     """
     Extract a sanitized function name from a comment line.
@@ -1835,7 +1849,14 @@ def extract_function_name(comment_line):
     return f"{name}.cpp"
 
 
-def split_kernel_file(input_file, output_dir):
+def extract_function_group(comment_line):
+    name = extract_marker_symbol(comment_line)
+    if "__" in name:
+        return name.rsplit("__", 1)[0]
+    return name
+
+
+def split_kernel_file(input_file, output_dir, func_index=None):
     """
     Split a kernel.cpp file into separate files based on comment markers.
     
@@ -1860,8 +1881,32 @@ def split_kernel_file(input_file, output_dir):
     
     current_section = []
     current_filename = None
-    section_count = 0
+    current_group_index = None
+    written_count = 0
     used_filenames = set()
+    group_indices = {}
+    group_names = []
+
+    if func_index is not None and func_index < 1:
+        print("Error: --func-index must be >= 1.")
+        return 1
+
+    def should_write_group(group_index):
+        return func_index is None or group_index == func_index
+
+    def flush_current_section():
+        nonlocal current_filename, current_section, current_group_index, written_count
+        if not current_filename or not current_section:
+            return
+        if not should_write_group(current_group_index):
+            return
+
+        output_filename = _unique_filename(current_filename, used_filenames)
+        for created_name in _write_section_outputs(
+            output_path, output_filename, current_section
+        ):
+            used_filenames.add(created_name)
+        written_count += 1
     
     i = 0
     while i < len(lines):
@@ -1869,29 +1914,16 @@ def split_kernel_file(input_file, output_dir):
         
         # Check if this line is a function marker comment
         if function_marker_pattern.match(line):
-            # Save previous section if it exists
-            if current_filename and current_section:
-                for created_name in _write_section_outputs(
-                    output_path, current_filename, current_section
-                ):
-                    used_filenames.add(created_name)
+            flush_current_section()
             
             # Start new section
             current_section = [line]
             current_filename = extract_function_name(line)
-            # Avoid accidental overwrite when multiple sections resolve to
-            # the same suffix-based filename.
-            if current_filename in used_filenames:
-                stem = Path(current_filename).stem
-                ext = Path(current_filename).suffix
-                suffix = 2
-                candidate = f"{stem}_{suffix}{ext}"
-                while candidate in used_filenames:
-                    suffix += 1
-                    candidate = f"{stem}_{suffix}{ext}"
-                current_filename = candidate
-            used_filenames.add(current_filename)
-            section_count += 1
+            current_group = extract_function_group(line)
+            if current_group not in group_indices:
+                group_indices[current_group] = len(group_names) + 1
+                group_names.append(current_group)
+            current_group_index = group_indices[current_group]
         else:
             # Add line to current section
             if current_section is not None:
@@ -1904,11 +1936,15 @@ def split_kernel_file(input_file, output_dir):
         i += 1
     
     # Save the last section
-    if current_filename and current_section:
-        for created_name in _write_section_outputs(
-            output_path, current_filename, current_section
-        ):
-            used_filenames.add(created_name)
+    flush_current_section()
+
+    if func_index is not None and written_count == 0:
+        print(
+            f"Error: requested func #{func_index}, but only found {len(group_names)} function group(s)."
+        )
+        for idx, name in enumerate(group_names, 1):
+            print(f"  {idx}: {name}")
+        return 1
 
     # The host split now emits host_cpp.cpp and host_pybind.cpp. Remove a stale
     # legacy host.cpp if it was left behind by an older run so callers don't
@@ -1925,7 +1961,13 @@ def split_kernel_file(input_file, output_dir):
         legacy_host.unlink()
         print(f"Removed stale: {legacy_host}")
     
-    print(f"\nSplit complete: {section_count} function(s) extracted to {output_dir}")
+    if func_index is None:
+        print(f"\nSplit complete: {written_count} function(s) extracted to {output_dir}")
+    else:
+        print(
+            f"\nSplit complete: {written_count} function(s) extracted from func #{func_index} to {output_dir}"
+        )
+    return 0
 
 
 def main():
@@ -1949,6 +1991,12 @@ Examples:
         default='/root/tt-metal/tt_metal/programming_examples/mlir_matmul_simple/kernels',
         help='Output directory for split files (default: split_output)'
     )
+    parser.add_argument(
+        '--func-index',
+        type=int,
+        default=None,
+        help='Only write translated sections for this 1-based source function group'
+    )
     
     args = parser.parse_args()
     
@@ -1957,8 +2005,7 @@ Examples:
         print(f"Error: Input file '{args.input_file}' not found.")
         return 1
     
-    split_kernel_file(args.input_file, args.output_dir)
-    return 0
+    return split_kernel_file(args.input_file, args.output_dir, args.func_index)
 
 
 if __name__ == '__main__':

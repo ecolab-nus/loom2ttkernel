@@ -4,4 +4,4 @@ Compiler stack: **Loom** (bufferized dataflow MLIR) → **TTKernel** (`tileloom_
 
 **Build:** `./build.sh` — CMake+Ninja into `build/`, builds `tileloom_to_ttkernel_opt`.
 
-**Codegen:** `./lower.sh <bufferized.mlir>` — requires a prior build and a tt-mlir build; `TTMLIR_BUILD_DIR` is taken from `build/CMakeCache.txt` when set there, else export it (see `lower.sh`). Input must be Loom-produced bufferized MLIR, e.g. `loom/test/matmul/wormhole/M256_N256_K256/IRs/p03_bufferized.mlir`.
+**Codegen:** `./lower.sh <bufferized.mlir> [func_index]` — requires a prior build and a tt-mlir build; `TTMLIR_BUILD_DIR` is taken from `build/CMakeCache.txt` when set there, else export it (see `lower.sh`). Input must be Loom-produced bufferized MLIR, e.g. `loom/test/matmul/wormhole/M256_N256_K256/IRs/p03_bufferized.mlir`. `func_index` is 1-based and limits split output to that translated source-function group. `./lower.sh 3` uses `LOWER_INPUT` or the repo's `test/matmul_2Dmesh/IRs/p03_bufferized.mlir` default.
