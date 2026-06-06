@@ -1812,8 +1812,8 @@ static bool shouldSwapDataMovementNocsForMatmul(::loom::CopyOp lhsLoad,
   int64_t k = lhsType.getDimSize(1);
   int64_t rhsK = rhsType.getDimSize(0);
   int64_t n = rhsType.getDimSize(1);
-  return k > 0 && n > 0 && rhsK == k && n <= k;
-  //return true;
+  //return k > 0 && n > 0 && rhsK == k && n <= k;
+  return true;
 }
 
 static void dropStaleSemaphoreCopyBindingAttrs(func::FuncOp func) {
@@ -3824,7 +3824,10 @@ private:
   }
 
   int64_t getInputCBBufferDepth() const {
-    return originalFunc.getName().contains("is_double_buffer0") ? 1 : 2;
+    auto symNameAttr = originalFunc->getAttrOfType<StringAttr>("sym_name");
+    return symNameAttr && symNameAttr.getValue().contains("is_double_buffer0")
+               ? 1
+               : 2;
   }
 
   bool useSplitHalfDataMovementCores() const {
