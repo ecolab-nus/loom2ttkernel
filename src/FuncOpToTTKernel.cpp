@@ -3443,14 +3443,31 @@ private:
       if (!cbMemrefType)
         return;
 
-      CircularBufferInfo info;
-      FailureOr<std::string> tilesExpr =
-          buildTilesExpr(cbMemrefType, alloc.getLoc());
-      if (failed(tilesExpr)) {
-        status = failure();
-        return;
+      bool isReductionScaleCb = false;
+      if (auto semIt = semaphoresByAlloc.find(alloc.getResult());
+          semIt != semaphoresByAlloc.end()) {
+        for (Value semValue : semIt->second) {
+          if (auto sem = semValue.getDefiningOp<::loom::SemaphoreTakeOp>()) {
+            if (sem->hasAttr(kReductionScaleCbAttrName)) {
+              isReductionScaleCb = true;
+              break;
+            }
+          }
+        }
       }
-      info.tilesExpr = *tilesExpr;
+
+      CircularBufferInfo info;
+      if (isReductionScaleCb) {
+        info.tilesExpr = "1";
+      } else {
+        FailureOr<std::string> tilesExpr =
+            buildTilesExpr(cbMemrefType, alloc.getLoc());
+        if (failed(tilesExpr)) {
+          status = failure();
+          return;
+        }
+        info.tilesExpr = *tilesExpr;
+      }
       info.allocValue = alloc.getResult();
       info.tilesVarName =
           "cb_tiles_per_block_" + std::to_string(cbInfos.size());
