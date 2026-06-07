@@ -390,6 +390,244 @@ static std::optional<int64_t> getElementByteSize(Type elementType) {
   return std::nullopt;
 }
 
+struct TiledMemrefTransferLayout {
+  SmallVector<int64_t, 4> shape;
+  SmallVector<int64_t, 4> strides;
+  int64_t leadingCount = 1;
+  int64_t numTileRows = 1;
+  int64_t numTileCols = 1;
+  int64_t tilesPerLogicalRow = 1;
+  int64_t totalTiles = 1;
+};
+
+static FailureOr<TiledMemrefTransferLayout>
+getTiledMemrefTransferLayout(MemRefType memrefType) {
+  if (!memrefType || !memrefType.hasStaticShape() || memrefType.getRank() < 2)
+    return failure();
+
+  TiledMemrefTransferLayout layout;
+  layout.shape.append(memrefType.getShape().begin(), memrefType.getShape().end());
+
+  auto stridedLayout = dyn_cast<StridedLayoutAttr>(memrefType.getLayout());
+  if (!stridedLayout)
+    return failure();
+  layout.strides.append(stridedLayout.getStrides().begin(),
+                        stridedLayout.getStrides().end());
+  if (layout.strides.size() != layout.shape.size())
+    return failure();
+
+  for (int64_t dim : layout.shape) {
+    if (dim <= 0)
+      return failure();
+  }
+  for (int64_t stride : layout.strides) {
+    if (ShapedType::isDynamic(stride) || stride <= 0)
+      return failure();
+  }
+
+  for (int64_t dim : ArrayRef<int64_t>(layout.shape).drop_back(2))
+    layout.leadingCount *= dim;
+
+  auto rows = ceilDiv32(layout.shape[layout.shape.size() - 2]);
+  auto cols = ceilDiv32(layout.shape.back());
+  auto tilesPerRow = ceilDiv32(layout.strides[layout.strides.size() - 2]);
+  if (!rows || !cols || !tilesPerRow)
+    return failure();
+
+  layout.numTileRows = *rows;
+  layout.numTileCols = *cols;
+  layout.tilesPerLogicalRow = *tilesPerRow;
+  layout.totalTiles = layout.leadingCount * layout.numTileRows * layout.numTileCols;
+  return layout;
+}
+
+static Value i32ConstRaw(ConversionPatternRewriter &rewriter, Location loc,
+                         int64_t value) {
+  return rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(),
+                                               value);
+}
+
+static Value computeLeadingElemOffset(ConversionPatternRewriter &rewriter,
+                                      Location loc,
+                                      const TiledMemrefTransferLayout &layout,
+                                      Value leadingLinear) {
+  Value offset = i32ConstRaw(rewriter, loc, 0);
+  int64_t leadingRank = static_cast<int64_t>(layout.shape.size()) - 2;
+  if (leadingRank <= 0)
+    return offset;
+
+  Value remaining = leadingLinear;
+  for (int64_t dim = leadingRank - 1; dim >= 0; --dim) {
+    Value dimSize = i32ConstRaw(rewriter, loc, layout.shape[dim]);
+    Value dimIndex =
+        arith::RemSIOp::create(rewriter, loc, remaining, dimSize);
+    Value dimStride = i32ConstRaw(rewriter, loc, layout.strides[dim]);
+    Value dimOffset =
+        arith::MulIOp::create(rewriter, loc, dimIndex, dimStride,
+                              arith::IntegerOverflowFlags::nsw);
+    offset = arith::AddIOp::create(rewriter, loc, offset, dimOffset,
+                                   arith::IntegerOverflowFlags::nsw);
+    if (dim > 0)
+      remaining = arith::DivSIOp::create(rewriter, loc, remaining, dimSize);
+  }
+
+  return offset;
+}
+
+static Value computeDramTileId(ConversionPatternRewriter &rewriter,
+                               Location loc, Value totalElemOffset,
+                               Value rowStride, Value tileDim,
+                               Value tilesPerLogicalRow) {
+  Value rowIdx =
+      arith::DivSIOp::create(rewriter, loc, totalElemOffset, rowStride);
+  Value colIdx =
+      arith::RemSIOp::create(rewriter, loc, totalElemOffset, rowStride);
+  Value rowTile = arith::DivSIOp::create(rewriter, loc, rowIdx, tileDim);
+  Value rowTileBase =
+      arith::MulIOp::create(rewriter, loc, rowTile, tilesPerLogicalRow,
+                            arith::IntegerOverflowFlags::nsw);
+  Value colTile = arith::DivSIOp::create(rewriter, loc, colIdx, tileDim);
+  return arith::AddIOp::create(rewriter, loc, rowTileBase, colTile,
+                               arith::IntegerOverflowFlags::nsw);
+}
+
+template <typename EmitTileFn>
+static void emitTiledMemrefTransferLoop(
+    ConversionPatternRewriter &rewriter, Location loc,
+    const TiledMemrefTransferLayout &layout, Value baseElemOffset,
+    Value baseL1Addr, Value pageSize, bool enableBarrier,
+    int64_t barrierThreshold, bool useReadBarrier, EmitTileFn emitTile) {
+  Value zero = i32ConstRaw(rewriter, loc, 0);
+  Value one = i32ConstRaw(rewriter, loc, 1);
+  Value tileDim = i32ConstRaw(rewriter, loc, 32);
+  Value leadingCount = i32ConstRaw(rewriter, loc, layout.leadingCount);
+  Value numTileRows = i32ConstRaw(rewriter, loc, layout.numTileRows);
+  Value numTileCols = i32ConstRaw(rewriter, loc, layout.numTileCols);
+  Value tilesPerPlane =
+      i32ConstRaw(rewriter, loc, layout.numTileRows * layout.numTileCols);
+  Value rowStride =
+      i32ConstRaw(rewriter, loc, layout.strides[layout.strides.size() - 2]);
+  Value colStride = i32ConstRaw(rewriter, loc, layout.strides.back());
+  Value tilesPerLogicalRow =
+      i32ConstRaw(rewriter, loc, layout.tilesPerLogicalRow);
+  Value barrierCount = zero;
+
+  scf::ForOp leadingLoop = scf::ForOp::create(
+      rewriter, loc, zero, leadingCount, one, ValueRange{barrierCount});
+  {
+    OpBuilder::InsertionGuard leadingGuard(rewriter);
+    rewriter.setInsertionPointToStart(leadingLoop.getBody());
+    Value leadingIdx = leadingLoop.getInductionVar();
+    Value loopBarrierCount = leadingLoop.getRegionIterArgs()[0];
+    Value leadingElemOffset =
+        computeLeadingElemOffset(rewriter, loc, layout, leadingIdx);
+
+    scf::ForOp rowLoop = scf::ForOp::create(
+        rewriter, loc, zero, numTileRows, one, ValueRange{loopBarrierCount});
+    {
+      OpBuilder::InsertionGuard rowGuard(rewriter);
+      rewriter.setInsertionPointToStart(rowLoop.getBody());
+      Value tileRow = rowLoop.getInductionVar();
+      Value rowBarrierCount = rowLoop.getRegionIterArgs()[0];
+
+      scf::ForOp colLoop = scf::ForOp::create(
+          rewriter, loc, zero, numTileCols, one, ValueRange{rowBarrierCount});
+      {
+        OpBuilder::InsertionGuard colGuard(rewriter);
+        rewriter.setInsertionPointToStart(colLoop.getBody());
+        Value tileCol = colLoop.getInductionVar();
+        Value colBarrierCount = colLoop.getRegionIterArgs()[0];
+
+        Value leadingTileBase =
+            arith::MulIOp::create(rewriter, loc, leadingIdx, tilesPerPlane,
+                                  arith::IntegerOverflowFlags::nsw);
+        Value rowTileBase =
+            arith::MulIOp::create(rewriter, loc, tileRow, numTileCols,
+                                  arith::IntegerOverflowFlags::nsw);
+        Value planeTileOffset =
+            arith::AddIOp::create(rewriter, loc, rowTileBase, tileCol,
+                                  arith::IntegerOverflowFlags::nsw);
+        Value tileLinear =
+            arith::AddIOp::create(rewriter, loc, leadingTileBase,
+                                  planeTileOffset,
+                                  arith::IntegerOverflowFlags::nsw);
+        Value l1ByteOffset =
+            arith::MulIOp::create(rewriter, loc, tileLinear, pageSize,
+                                  arith::IntegerOverflowFlags::nsw);
+        Value tileL1Addr =
+            arith::AddIOp::create(rewriter, loc, baseL1Addr, l1ByteOffset,
+                                  arith::IntegerOverflowFlags::nsw);
+
+        Value rowOffset =
+            arith::MulIOp::create(rewriter, loc, tileRow, tileDim,
+                                  arith::IntegerOverflowFlags::nsw);
+        rowOffset = arith::MulIOp::create(rewriter, loc, rowOffset, rowStride,
+                                          arith::IntegerOverflowFlags::nsw);
+        Value colOffset =
+            arith::MulIOp::create(rewriter, loc, tileCol, tileDim,
+                                  arith::IntegerOverflowFlags::nsw);
+        colOffset = arith::MulIOp::create(rewriter, loc, colOffset, colStride,
+                                          arith::IntegerOverflowFlags::nsw);
+        Value tileElemOffset =
+            arith::AddIOp::create(rewriter, loc, leadingElemOffset, rowOffset,
+                                  arith::IntegerOverflowFlags::nsw);
+        tileElemOffset =
+            arith::AddIOp::create(rewriter, loc, tileElemOffset, colOffset,
+                                  arith::IntegerOverflowFlags::nsw);
+        Value totalElemOffset =
+            arith::AddIOp::create(rewriter, loc, baseElemOffset, tileElemOffset,
+                                  arith::IntegerOverflowFlags::nsw);
+
+        Value tileId = computeDramTileId(
+            rewriter, loc, totalElemOffset, rowStride, tileDim,
+            tilesPerLogicalRow);
+        emitTile(tileId, tileL1Addr);
+
+        if (enableBarrier) {
+          colBarrierCount =
+              arith::AddIOp::create(rewriter, loc, colBarrierCount, one,
+                                    arith::IntegerOverflowFlags::nsw);
+          Value barrierThresholdValue =
+              i32ConstRaw(rewriter, loc, barrierThreshold);
+          Value shouldBarrier = arith::CmpIOp::create(
+              rewriter, loc, arith::CmpIPredicate::eq, colBarrierCount,
+              barrierThresholdValue);
+          auto barrierIf = scf::IfOp::create(
+              rewriter, loc, TypeRange{rewriter.getI32Type()}, shouldBarrier,
+              true);
+          {
+            OpBuilder::InsertionGuard guard(rewriter);
+            rewriter.setInsertionPointToStart(
+                &barrierIf.getThenRegion().front());
+            if (useReadBarrier)
+              NocAsyncReadBarrierOp::create(rewriter, loc);
+            else
+              NocAsyncWriteBarrierOp::create(rewriter, loc);
+            scf::YieldOp::create(rewriter, loc, ValueRange{zero});
+
+            rewriter.setInsertionPointToStart(
+                &barrierIf.getElseRegion().front());
+            scf::YieldOp::create(rewriter, loc,
+                                 ValueRange{colBarrierCount});
+          }
+          rewriter.setInsertionPointAfter(barrierIf);
+          colBarrierCount = barrierIf.getResult(0);
+        }
+
+        scf::YieldOp::create(rewriter, loc, ValueRange{colBarrierCount});
+      }
+
+      rewriter.setInsertionPointAfter(colLoop);
+      scf::YieldOp::create(rewriter, loc, colLoop.getResults());
+    }
+
+    rewriter.setInsertionPointAfter(rowLoop);
+    scf::YieldOp::create(rewriter, loc, rowLoop.getResults());
+  }
+
+  rewriter.setInsertionPointAfter(leadingLoop);
+}
+
 static int64_t getPackedWordForScalarOne(Type elementType) {
   if (auto tileType = dyn_cast_or_null<TileType>(elementType)) {
     switch (tileType.getDataType()) {
@@ -871,29 +1109,19 @@ std::pair<Value, Value> dram_read(Value source, Location loc,
     }
     rewriter.setInsertionPointAfter(colLoop);
   } else {
-    // Calculate number of tiles in each dimension: numTiles = shape / 32.
-    int64_t numTileRows = (shape[shape.size() - 2] + kTileDim - 1) / kTileDim;
-    int64_t numTileCols = (shape[shape.size() - 1] + kTileDim - 1) / kTileDim;
+    auto layout = getTiledMemrefTransferLayout(resultType);
+    if (failed(layout)) {
+      emitError(loc) << "DRAM read requires rank >= 2 static strided memref "
+                        "layout with positive dimensions/strides";
+      return std::make_pair(Value(), Value());
+    }
 
-    Value numTileRowsVal = rewriter.create<arith::ConstantIntOp>(
-        loc, rewriter.getI32Type(), numTileRows);
-    Value numTileColsVal = rewriter.create<arith::ConstantIntOp>(
-        loc, rewriter.getI32Type(), numTileCols);
-    Value stride0Val = rewriter.create<arith::ConstantIntOp>(
-        loc, rewriter.getI32Type(),
-        (strides.size() > 1) ? strides[strides.size() - 2] : 1);
-    Value stride1Val = rewriter.create<arith::ConstantIntOp>(
-        loc, rewriter.getI32Type(),
-        (strides.size() > 0) ? strides[strides.size() - 1] : 1);
-
-    int64_t totalTiles = numTileRows * numTileCols;
+    int64_t totalTiles = layout->totalTiles;
     bool enableReadBarrier =
         totalTiles > 16 && !matmulMergeBReaderIntoWriter;
     int64_t numCores =
         bindingData->parallelCoreCount > 0 ? bindingData->parallelCoreCount : 1;
     int64_t barrierReadThreshold = 1;
-    Value barrierCount =
-        rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(), 0);
     if (enableReadBarrier) {
       // 2048 represents the tile size.
       barrierReadThreshold = (512 / numCores) * (1024 + 128) / 2048;
@@ -901,95 +1129,12 @@ std::pair<Value, Value> dram_read(Value source, Location loc,
         barrierReadThreshold = 1;
     }
 
-    // Create nested loops to iterate over all tiles.
-    scf::ForOp rowLoop = scf::ForOp::create(rewriter, loc, loopConst0,
-                                            numTileRowsVal, loopConst1,
-                                            ValueRange{l1Addr, barrierCount});
-    {
-      rewriter.setInsertionPointToStart(rowLoop.getBody());
-      Value tileRow = rowLoop.getInductionVar();
-      Value crtL1Addr = rowLoop.getRegionIterArgs()[0];
-      barrierCount = rowLoop.getRegionIterArgs()[1];
-
-      scf::ForOp colLoop = scf::ForOp::create(rewriter, loc, loopConst0,
-                                              numTileColsVal, loopConst1,
-                                              ValueRange{crtL1Addr,
-                                                         barrierCount});
-      {
-        rewriter.setInsertionPointToStart(colLoop.getBody());
-        Value tileCol = colLoop.getInductionVar();
-        Value innerL1Addr = colLoop.getRegionIterArgs()[0];
-        barrierCount = colLoop.getRegionIterArgs()[1];
-
-        Value rowOffset = arith::MulIOp::create(
-            rewriter, loc, tileRow, tileDimVal, arith::IntegerOverflowFlags::nsw);
-        rowOffset = arith::MulIOp::create(rewriter, loc, rowOffset, stride0Val,
-                                          arith::IntegerOverflowFlags::nsw);
-
-        Value colOffset = arith::MulIOp::create(
-            rewriter, loc, tileCol, tileDimVal, arith::IntegerOverflowFlags::nsw);
-        colOffset = arith::MulIOp::create(rewriter, loc, colOffset, stride1Val,
-                                          arith::IntegerOverflowFlags::nsw);
-
-        Value tileElemOffset = arith::AddIOp::create(
-            rewriter, loc, rowOffset, colOffset, arith::IntegerOverflowFlags::nsw);
-        Value totalElemOffset = arith::AddIOp::create(
-            rewriter, loc, baseElemOffset, tileElemOffset,
-            arith::IntegerOverflowFlags::nsw);
-
-        Value rowIdx =
-            arith::DivSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
-        Value colIdx =
-            arith::RemSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
-        Value tilesPerRow =
-            arith::DivSIOp::create(rewriter, loc, stride0Val, tileDimVal);
-        Value rowTile =
-            arith::DivSIOp::create(rewriter, loc, rowIdx, tileDimVal);
-        Value rowTileBase = arith::MulIOp::create(
-            rewriter, loc, rowTile, tilesPerRow, arith::IntegerOverflowFlags::nsw);
-        Value colTile =
-            arith::DivSIOp::create(rewriter, loc, colIdx, tileDimVal);
-        Value tileId = arith::AddIOp::create(rewriter, loc, rowTileBase, colTile,
-                                             arith::IntegerOverflowFlags::nsw);
-
+    emitTiledMemrefTransferLoop(
+        rewriter, loc, *layout, baseElemOffset, l1Addr, pageSize,
+        enableReadBarrier, barrierReadThreshold, /*useReadBarrier=*/true,
+        [&](Value tileId, Value innerL1Addr) {
         NocAsyncReadTileOp::create(rewriter, loc, tileId, accessorOp, innerL1Addr);
-        Value nextL1Addr = arith::AddIOp::create(
-            rewriter, loc, innerL1Addr, pageSize, arith::IntegerOverflowFlags::nsw);
-        if (enableReadBarrier) {
-          barrierCount = arith::AddIOp::create(
-              rewriter, loc, barrierCount, loopConst1,
-              arith::IntegerOverflowFlags::nsw);
-          Value barrierThreshold = rewriter.create<arith::ConstantIntOp>(
-              loc, rewriter.getI32Type(), barrierReadThreshold);
-          Value shouldReadBarrier = arith::CmpIOp::create(
-              rewriter, loc, arith::CmpIPredicate::eq,
-              barrierCount, barrierThreshold);
-
-          auto barrierIf = scf::IfOp::create(
-              rewriter, loc, TypeRange{rewriter.getI32Type()},
-              shouldReadBarrier, true);
-          {
-            OpBuilder::InsertionGuard guard(rewriter);
-            rewriter.setInsertionPointToStart(
-                &barrierIf.getThenRegion().front());
-            NocAsyncReadBarrierOp::create(rewriter, loc);
-            scf::YieldOp::create(rewriter, loc, ValueRange{loopConst0});
-
-            rewriter.setInsertionPointToStart(
-                &barrierIf.getElseRegion().front());
-            scf::YieldOp::create(rewriter, loc, ValueRange{barrierCount});
-          }
-          rewriter.setInsertionPointAfter(barrierIf);
-          barrierCount = barrierIf.getResult(0);
-        }
-        scf::YieldOp::create(rewriter, loc,
-                             ValueRange{nextL1Addr, barrierCount});
-      }
-
-      rewriter.setInsertionPointAfter(colLoop);
-      scf::YieldOp::create(rewriter, loc, colLoop.getResults());
-    }
-    rewriter.setInsertionPointAfter(rowLoop);
+        });
   }
 
   // Barrier to wait for all async reads to complete.
@@ -1406,6 +1551,7 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
     auto cbType = cast<CBType>(cb.getType());
     auto elementType = cbType.getElementType();
     Value numPages;
+    auto resultType = cast<MemRefType>(reinterpretCastOp.getResult().getType());
     std::optional<int64_t> annotatedVecTiles = getAnnotatedVecTiles(op);
     std::optional<int64_t> rank1VecTiles =
         getRank1VecTilesFromMemref(reinterpretCastOp.getResult().getType());
@@ -1438,6 +1584,13 @@ struct ConvertLoomMemoryLoadOp : public OpConversionPattern<::loom::CopyOp> {
       const int32_t numTiles = cbType.getNumTiles();
       numPages = rewriter.create<arith::ConstantIntOp>(
           loc, rewriter.getI32Type(), numTiles);
+    } else if (resultType.getRank() >= 2) {
+      auto numTiles = getNumTilesFromShapedType(resultType);
+      if (!numTiles)
+        return op.emitOpError(
+            "failed to derive tiled page count for DRAM load");
+      numPages = rewriter.create<arith::ConstantIntOp>(
+          loc, rewriter.getI32Type(), *numTiles);
     } else {
       const int64_t numElements = cbType.getNumElements();
       auto elementSizeBytes = getElementByteSize(elementType);
@@ -1625,6 +1778,8 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
       offsetI32 = rewriter.create<arith::IndexCastOp>(
           loc, rewriter.getI32Type(), offsetI32);
 
+    auto resultType = cast<MemRefType>(reinterpretCastOp.getResult().getType());
+
     // Compute number of pages.
     auto cbType = cast<CBType>(cb.getType());
     Value numPages;
@@ -1633,17 +1788,20 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
       const int32_t numTiles = cbType.getNumTiles();
       numPages = rewriter.create<arith::ConstantIntOp>(
           loc, rewriter.getI32Type(), numTiles);
+    } else if (resultType.getRank() >= 2) {
+      auto numTiles = getNumTilesFromShapedType(resultType);
+      if (!numTiles)
+        return op.emitOpError(
+            "failed to derive tiled page count for DRAM store");
+      numPages = rewriter.create<arith::ConstantIntOp>(
+          loc, rewriter.getI32Type(), *numTiles);
     } else {
       const int64_t numElements = cbType.getNumElements();
-      int32_t elementSizeBytes = 4;
-      if (elementType.isF16() || elementType.isBF16())
-        elementSizeBytes = 2;
-      else if (elementType.isF32())
-        elementSizeBytes = 4;
-      else if (auto intType = llvm::dyn_cast<IntegerType>(elementType))
-        elementSizeBytes = (intType.getWidth() + 7) / 8;
+      auto elementSizeBytes = getElementByteSize(elementType);
+      if (!elementSizeBytes)
+        return op.emitOpError("unsupported CB element type for DRAM store");
       Value totalSizeBytes = rewriter.create<arith::ConstantIntOp>(
-          loc, rewriter.getI32Type(), numElements * elementSizeBytes);
+          loc, rewriter.getI32Type(), numElements * *elementSizeBytes);
       numPages = ceilDivSICompat(rewriter, loc, totalSizeBytes, pageSize);
     }
 
@@ -1652,25 +1810,16 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
       return op.emitOpError("missing TensorAccessor runtime arg for DRAM store");
 
     Value baseElemOffset = offsetI32;
-    auto resultType = cast<MemRefType>(reinterpretCastOp.getResult().getType());
-    ArrayRef<int64_t> shape = resultType.getShape();
-
-    SmallVector<int64_t> strides;
-    auto layout = resultType.getLayout();
-    if (auto stridedLayout = dyn_cast<StridedLayoutAttr>(layout)) {
-      auto stridesRef = stridedLayout.getStrides();
-      strides.append(stridesRef.begin(), stridesRef.end());
-    } else {
+    auto layout = getTiledMemrefTransferLayout(resultType);
+    if (failed(layout)) {
       return op.emitOpError()
-             << "DRAM store requires explicit strided memref layout; "
-                "row-major stride synthesis is not allowed";
+             << "DRAM store requires rank >= 2 static strided memref layout "
+                "with positive dimensions/strides";
     }
 
     constexpr int64_t kTileDim = 32;
-    int64_t numTileRows =
-        (shape.size() > 1) ? (shape[shape.size() - 2] + kTileDim - 1) / kTileDim : 1;
-    int64_t numTileCols =
-        (shape.size() > 0) ? (shape[shape.size() - 1] + kTileDim - 1) / kTileDim : 1;
+    int64_t numTileRows = layout->numTileRows;
+    int64_t numTileCols = layout->numTileCols;
 
     Value loopConst0 =
         rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(), 0);
@@ -1684,10 +1833,11 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
         loc, rewriter.getI32Type(), numTileCols);
     Value stride0Val = rewriter.create<arith::ConstantIntOp>(
         loc, rewriter.getI32Type(),
-        (strides.size() > 1) ? strides[strides.size() - 2] : 1);
+        layout->strides[layout->strides.size() - 2]);
     Value stride1Val = rewriter.create<arith::ConstantIntOp>(
-        loc, rewriter.getI32Type(),
-        (strides.size() > 0) ? strides[strides.size() - 1] : 1);
+        loc, rewriter.getI32Type(), layout->strides.back());
+    Value tilesPerLogicalRowVal = rewriter.create<arith::ConstantIntOp>(
+        loc, rewriter.getI32Type(), layout->tilesPerLogicalRow);
 
     if (op->hasAttr(kMatmulStreamStoreAttrName)) {
       FailureOr<MatmulSubblockInfo> subblock =
@@ -1695,6 +1845,10 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
       if (failed(subblock))
         return op.emitOpError()
                << "missing precomputed streamed matmul store subblock attrs";
+      if (layout->leadingCount != 1)
+        return op.emitOpError()
+               << "streamed matmul DRAM store only supports a single leading "
+                  "slice";
 
       auto minI32 = [&](Value lhs, Value rhs) -> Value {
         Value takeLhs = rewriter.create<arith::CmpIOp>(
@@ -1715,20 +1869,9 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
             arith::AddIOp::create(rewriter, loc, rowOffset, colOffset);
         Value totalElemOffset =
             arith::AddIOp::create(rewriter, loc, baseElemOffset, tileElemOffset);
-        Value rowIdx =
-            arith::DivSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
-        Value colIdx =
-            arith::RemSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
-        Value tilesPerRow =
-            arith::DivSIOp::create(rewriter, loc, stride0Val, tileDimVal);
-        Value rowTile =
-            arith::DivSIOp::create(rewriter, loc, rowIdx, tileDimVal);
-        Value rowTileBase =
-            arith::MulIOp::create(rewriter, loc, rowTile, tilesPerRow);
-        Value colTile =
-            arith::DivSIOp::create(rewriter, loc, colIdx, tileDimVal);
         Value tileId =
-            arith::AddIOp::create(rewriter, loc, rowTileBase, colTile);
+            computeDramTileId(rewriter, loc, totalElemOffset, stride0Val,
+                              tileDimVal, tilesPerLogicalRowVal);
         NocAsyncWriteTileOp::create(rewriter, loc, tileId, accessorOp,
                                     tileL1Addr);
       };
@@ -1811,14 +1954,12 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
     CBWaitFrontOp::create(rewriter, loc, cb, numPages);
     Value l1Addr = GetReadPtrOp::create(rewriter, loc, cb);
 
-    int64_t totalTiles = numTileRows * numTileCols;
+    int64_t totalTiles = layout->totalTiles;
     bool enableWriteBarrier =
         totalTiles > 16 && !matmulMergeBReaderIntoWriter;
     int64_t numCores =
         bindingData->parallelCoreCount > 0 ? bindingData->parallelCoreCount : 1;
     int64_t barrierWriteThreshold = 1;
-    Value barrierCount =
-        rewriter.create<arith::ConstantIntOp>(loc, rewriter.getI32Type(), 0);
     if (enableWriteBarrier) {
       // 2048 represents the tile size.
       //maybe it is better to be a fixed number of 4 for both blackhole and wormhole. For blackhole, barrierWriteThreshold is 2, too small and harm the performance.
@@ -1828,99 +1969,13 @@ struct ConvertLoomMemoryStoreOp : public OpConversionPattern<::loom::CopyOp> {
         barrierWriteThreshold = 1;
     }
 
-    scf::ForOp rowLoop =
-        scf::ForOp::create(rewriter, loc, loopConst0, numTileRowsVal,
-                           loopConst1, ValueRange{l1Addr, barrierCount});
-    {
-      rewriter.setInsertionPointToStart(rowLoop.getBody());
-      Value tileRow = rowLoop.getInductionVar();
-      Value crtL1Addr = rowLoop.getRegionIterArgs()[0];
-      barrierCount = rowLoop.getRegionIterArgs()[1];
-
-      scf::ForOp colLoop =
-          scf::ForOp::create(rewriter, loc, loopConst0, numTileColsVal,
-                             loopConst1,
-                             ValueRange{crtL1Addr, barrierCount});
-      {
-        rewriter.setInsertionPointToStart(colLoop.getBody());
-        Value tileCol = colLoop.getInductionVar();
-        Value innerL1Addr = colLoop.getRegionIterArgs()[0];
-        barrierCount = colLoop.getRegionIterArgs()[1];
-
-        Value rowOffset =
-            arith::MulIOp::create(rewriter, loc, tileRow, tileDimVal,
-                                  arith::IntegerOverflowFlags::nsw);
-        rowOffset = arith::MulIOp::create(rewriter, loc, rowOffset, stride0Val,
-                                          arith::IntegerOverflowFlags::nsw);
-        Value colOffset =
-            arith::MulIOp::create(rewriter, loc, tileCol, tileDimVal,
-                                  arith::IntegerOverflowFlags::nsw);
-        colOffset = arith::MulIOp::create(rewriter, loc, colOffset, stride1Val,
-                                          arith::IntegerOverflowFlags::nsw);
-        Value tileElemOffset =
-            arith::AddIOp::create(rewriter, loc, rowOffset, colOffset,
-                                  arith::IntegerOverflowFlags::nsw);
-        Value totalElemOffset = arith::AddIOp::create(
-            rewriter, loc, baseElemOffset, tileElemOffset,
-            arith::IntegerOverflowFlags::nsw);
-
-        Value rowIdx =
-            arith::DivSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
-        Value colIdx =
-            arith::RemSIOp::create(rewriter, loc, totalElemOffset, stride0Val);
-        Value tilesPerRow =
-            arith::DivSIOp::create(rewriter, loc, stride0Val, tileDimVal);
-        Value rowTile =
-            arith::DivSIOp::create(rewriter, loc, rowIdx, tileDimVal);
-        Value rowTileBase =
-            arith::MulIOp::create(rewriter, loc, rowTile, tilesPerRow,
-                                  arith::IntegerOverflowFlags::nsw);
-        Value colTile =
-            arith::DivSIOp::create(rewriter, loc, colIdx, tileDimVal);
-        Value tileId =
-            arith::AddIOp::create(rewriter, loc, rowTileBase, colTile,
-                                  arith::IntegerOverflowFlags::nsw);
+    emitTiledMemrefTransferLoop(
+        rewriter, loc, *layout, baseElemOffset, l1Addr, pageSize,
+        enableWriteBarrier, barrierWriteThreshold, /*useReadBarrier=*/false,
+        [&](Value tileId, Value innerL1Addr) {
         NocAsyncWriteTileOp::create(rewriter, loc, tileId, accessorOp,
                                     innerL1Addr);
-
-        Value nextL1Addr =
-            arith::AddIOp::create(rewriter, loc, innerL1Addr, pageSize,
-                                  arith::IntegerOverflowFlags::nsw);
-        if (enableWriteBarrier) {
-          barrierCount = arith::AddIOp::create(
-              rewriter, loc, barrierCount, loopConst1,
-              arith::IntegerOverflowFlags::nsw);
-          Value barrierThreshold = rewriter.create<arith::ConstantIntOp>(
-              loc, rewriter.getI32Type(), barrierWriteThreshold);
-          Value shouldWriteBarrier = arith::CmpIOp::create(
-              rewriter, loc, arith::CmpIPredicate::eq, barrierCount,
-              barrierThreshold);
-
-          auto barrierIf = scf::IfOp::create(
-              rewriter, loc, TypeRange{rewriter.getI32Type()},
-              shouldWriteBarrier, true);
-          {
-            OpBuilder::InsertionGuard guard(rewriter);
-            rewriter.setInsertionPointToStart(
-                &barrierIf.getThenRegion().front());
-            NocAsyncWriteBarrierOp::create(rewriter, loc);
-            scf::YieldOp::create(rewriter, loc, ValueRange{loopConst0});
-
-            rewriter.setInsertionPointToStart(
-                &barrierIf.getElseRegion().front());
-            scf::YieldOp::create(rewriter, loc, ValueRange{barrierCount});
-          }
-          rewriter.setInsertionPointAfter(barrierIf);
-          barrierCount = barrierIf.getResult(0);
-        }
-        scf::YieldOp::create(rewriter, loc,
-                             ValueRange{nextL1Addr, barrierCount});
-      }
-
-      rewriter.setInsertionPointAfter(colLoop);
-      scf::YieldOp::create(rewriter, loc, colLoop.getResults());
-    }
-    rewriter.setInsertionPointAfter(rowLoop);
+        });
 
     NocAsyncWriteBarrierOp::create(rewriter, loc);
     CBPopFrontOp::create(rewriter, loc, cb, numPages);
