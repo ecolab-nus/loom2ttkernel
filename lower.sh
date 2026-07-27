@@ -1,8 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-mkdir -p tmp_output
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+MLIR_OUTPUT_DIR="${LOWER_MLIR_OUTPUT_DIR:-${REPO_ROOT}/tmp_output/tmp_mlir_files}"
+KERNEL_OUTPUT_DIR="${SPLIT_KERNEL_OUTPUT_DIR:-${REPO_ROOT}/tmp_output/kernels}"
+mkdir -p "${MLIR_OUTPUT_DIR}" "${KERNEL_OUTPUT_DIR}"
+
+# Relocate intermediates left in the old output directory by earlier runs.
+for legacy_file in "${REPO_ROOT}"/tmp_output/*.mlir "${REPO_ROOT}"/tmp_output/kernel.cpp; do
+  if [[ -f "${legacy_file}" ]]; then
+    mv "${legacy_file}" "${MLIR_OUTPUT_DIR}/"
+  fi
+done
+
 LOOM2TTKERNEL_BUILD_DIR="${LOOM2TTKERNEL_BUILD_DIR:-${SCRIPT_DIR}/build}"
 CMAKE_CACHE="${LOOM2TTKERNEL_BUILD_DIR}/CMakeCache.txt"
 
@@ -74,25 +85,28 @@ if [[ -n "${TILELOOM_TO_TTKERNEL_OPTIONS:-}" ]]; then
   TILELOOM_PASS_ARG="--loom-tileloom-to-ttkernel=${TILELOOM_TO_TTKERNEL_OPTIONS}"
 fi
 
-"${TILELOOM_TO_TTKERNEL_OPT}" "${TILELOOM_PASS_ARG}" "${INPUT_MLIR}" -o ./tmp_output/kernel_ttkernel.mlir
+KERNEL_TTKERNEL_MLIR="${MLIR_OUTPUT_DIR}/kernel_ttkernel.mlir"
+KERNEL_EMITC_MLIR="${MLIR_OUTPUT_DIR}/kernel_emitc.mlir"
+KERNEL_EMITC_FORMEXPR_MLIR="${MLIR_OUTPUT_DIR}/kernel_emitc_formexpr.mlir"
+KERNEL_EMITC_HOSTSIG_MLIR="${MLIR_OUTPUT_DIR}/kernel_emitc_hostsig.mlir"
+KERNEL_CPP="${MLIR_OUTPUT_DIR}/kernel.cpp"
 
-"${PYTHON}" "${REPLACE_PY}" tmp_output/kernel_ttkernel.mlir
+"${TILELOOM_TO_TTKERNEL_OPT}" "${TILELOOM_PASS_ARG}" "${INPUT_MLIR}" -o "${KERNEL_TTKERNEL_MLIR}"
 
-"${TTMLIR_OPT}" -canonicalize -cse -canonicalize --convert-ttkernel-to-emitc -canonicalize -cse -canonicalize -sccp -canonicalize tmp_output/kernel_ttkernel.mlir -o tmp_output/kernel_emitc.mlir
+"${PYTHON}" "${REPLACE_PY}" "${KERNEL_TTKERNEL_MLIR}"
+
+"${TTMLIR_OPT}" -canonicalize -cse -canonicalize --convert-ttkernel-to-emitc -canonicalize -cse -canonicalize -sccp -canonicalize "${KERNEL_TTKERNEL_MLIR}" -o "${KERNEL_EMITC_MLIR}"
 
 # Fold EmitC SSA temporaries (especially cast chains like i32<->ui32/ptrdiff_t)
 # into expressions so generated C++ is substantially cleaner.
-"${TTMLIR_OPT}" --form-expressions tmp_output/kernel_emitc.mlir -o tmp_output/kernel_emitc_formexpr.mlir
-mv tmp_output/kernel_emitc_formexpr.mlir tmp_output/kernel_emitc.mlir
+"${TTMLIR_OPT}" --form-expressions "${KERNEL_EMITC_MLIR}" -o "${KERNEL_EMITC_FORMEXPR_MLIR}"
+mv "${KERNEL_EMITC_FORMEXPR_MLIR}" "${KERNEL_EMITC_MLIR}"
 
-"${TILELOOM_TO_TTKERNEL_OPT}" --loom-post-emitc-host-signature tmp_output/kernel_emitc.mlir -o tmp_output/kernel_emitc_hostsig.mlir
+"${TILELOOM_TO_TTKERNEL_OPT}" --loom-post-emitc-host-signature "${KERNEL_EMITC_MLIR}" -o "${KERNEL_EMITC_HOSTSIG_MLIR}"
 
-"${TTMLIR_TRANSLATE}" --ttkernel-to-cpp tmp_output/kernel_emitc_hostsig.mlir -o tmp_output/kernel.cpp
+"${TTMLIR_TRANSLATE}" --ttkernel-to-cpp "${KERNEL_EMITC_HOSTSIG_MLIR}" -o "${KERNEL_CPP}"
 
-SPLIT_KERNEL_ARGS=(tmp_output/kernel.cpp)
-if [[ -n "${SPLIT_KERNEL_OUTPUT_DIR:-}" ]]; then
-  SPLIT_KERNEL_ARGS+=(--output-dir "${SPLIT_KERNEL_OUTPUT_DIR}")
-fi
+SPLIT_KERNEL_ARGS=("${KERNEL_CPP}" --output-dir "${KERNEL_OUTPUT_DIR}")
 if [[ -n "${FUNC_INDEX}" ]]; then
   SPLIT_KERNEL_ARGS+=(--func-index "${FUNC_INDEX}")
 fi
