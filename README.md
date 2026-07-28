@@ -2,6 +2,9 @@
 
 Compiler stack: **Loom** (bufferized dataflow MLIR) → **TTKernel** (`tileloom_to_ttkernel_opt`) → **tt-mlir** (EmitC + `ttkernel-to-cpp`) → **tt-metal**-style C++ (`kernel.cpp`, then `split_kernel.py`).
 
-**Build:** `./build.sh` — CMake+Ninja into `build/`, builds `tileloom_to_ttkernel_opt`.
+**Build:** configure the standalone ADL dialect package first, then run
+`./build.sh -DADLDialect_DIR=/path/to/adl/install/lib/cmake/ADLDialect`.
+CMake+Ninja builds `tileloom_to_ttkernel_opt` into `build/`. The Loom
+monorepo’s `install-docker.sh` supplies this dependency automatically.
 
 **Codegen:** `./lower.sh <bufferized.mlir> [func_index]` — requires a prior build and a tt-mlir build; `TTMLIR_BUILD_DIR` is taken from `build/CMakeCache.txt` when set there, else export it (see `lower.sh`). Input must be Loom-produced bufferized MLIR, e.g. `loom/test/matmul/wormhole/M256_N256_K256/IRs/p03_bufferized.mlir`. `func_index` is 1-based and limits split output to that translated source-function group. `./lower.sh 3` uses `LOWER_INPUT` or the repo's `test/matmul_2Dmesh/IRs/p03_bufferized.mlir` default.

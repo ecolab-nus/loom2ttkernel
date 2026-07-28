@@ -28,9 +28,11 @@ set(TTMLIR_BUILD_DIR "${TTMLIR_SOURCE_DIR}/build" CACHE PATH
     "Path to an already configured/built tt-mlir build directory")
 
 find_package(MLIR REQUIRED CONFIG)
+find_package(ADLDialect REQUIRED CONFIG)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+message(STATUS "Using ADLDialectConfig.cmake in: ${ADLDialect_DIR}")
 message(STATUS "Using Loom source dir: ${LOOM_SOURCE_DIR}")
 message(STATUS "Using Loom build dir: ${LOOM_BUILD_DIR}")
 message(STATUS "Using tt-mlir source dir: ${TTMLIR_SOURCE_DIR}")
@@ -66,7 +68,6 @@ set(TTMLIR_INCLUDE_DIR "${TTMLIR_SOURCE_DIR}/include")
 set(TTMLIR_BUILD_INCLUDE_DIR "${TTMLIR_BUILD_DIR}/include")
 set(TTMLIR_LIB_DIR "${TTMLIR_BUILD_DIR}/lib")
 set(LOOM_DIALECT_INC_DIR "${LOOM_BUILD_DIR}/lib/loom-dialect/IR")
-set(ADL_DIALECT_INC_DIR "${LOOM_BUILD_DIR}/lib/adl-dialect/IR")
 set(LOOM_LIB_DIR "${LOOM_BUILD_DIR}/lib")
 
 require_path("${TTMLIR_INCLUDE_DIR}/ttmlir/Dialect/TTKernel/IR/TTKernel.h"
@@ -77,11 +78,8 @@ require_path("${LOOM_DIALECT_INC_DIR}/LoomOps.h.inc"
              "generated Loom dialect headers")
 require_path("${LOOM_DIALECT_INC_DIR}/LoomInterfaces.h.inc"
              "generated Loom interface headers")
-require_path("${ADL_DIALECT_INC_DIR}/ADLDialect.h.inc"
-             "generated ADL dialect headers")
 
 import_static_library(loomDialect "${LOOM_LIB_DIR}/libloomDialect.a")
-import_static_library(loomADLDialect "${LOOM_LIB_DIR}/libloomADLDialect.a")
 import_static_library(TTMLIRTTKernelDialect
                       "${TTMLIR_LIB_DIR}/libMLIRTTKernelDialect.a")
 import_static_library(TTMLIRTTCoreDialect
@@ -90,7 +88,6 @@ import_static_library(TTMLIRTTMetalDialect
                       "${TTMLIR_LIB_DIR}/libMLIRTTMetalDialect.a")
 
 target_include_directories(loomDialect INTERFACE "${LOOM_DIALECT_INC_DIR}")
-target_include_directories(loomADLDialect INTERFACE "${ADL_DIALECT_INC_DIR}")
 target_include_directories(TTMLIRTTKernelDialect INTERFACE
   "${TTMLIR_INCLUDE_DIR}"
   "${TTMLIR_BUILD_INCLUDE_DIR}"
@@ -180,12 +177,11 @@ target_include_directories(tileloom_to_ttkernel_opt PRIVATE
   ${TTMLIR_INCLUDE_DIR}
   ${TTMLIR_BUILD_INCLUDE_DIR}
   ${LOOM_DIALECT_INC_DIR}
-  ${ADL_DIALECT_INC_DIR}
 )
 
 target_link_libraries(tileloom_to_ttkernel_opt PRIVATE
   loomTileLoomToTTKernel
-  loomADLDialect
+  ADLDialect::IR
   loomDialect
   MLIRMlirOptMain
   ${LOOM2TTKERNEL_AVAILABLE_MLIR_LIBS}

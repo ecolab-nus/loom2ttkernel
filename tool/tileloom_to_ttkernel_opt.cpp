@@ -24,7 +24,7 @@
 #include "llvm/Support/CommandLine.h"
 
 // ADL dialect for hardware/resource descriptions.
-#include "ADLDialect.h.inc"
+#include "ADL/IR/ADLDialect.h"
 // Loom dialect (loom.*) for loom.alloc, loom.copy, etc.
 #include "LoomDialect.h.inc"
 // TTKernel dialect from tt-mlir (types like DataFormatType, ops, etc.).
@@ -42,7 +42,7 @@ int main(int argc, char **argv) {
   registerAllDialects(registry);
   registerAllPasses();
   // Register ADL dialect for hardware/resource descriptions.
-  registry.insert<adl::ADLDialect>();
+  registry.insert<mlir::adl::ADLDialect>();
   // Register Loom dialect so loom.alloc, loom.copy, etc. are available.
   registry.insert<::loom::LoomDialect>();
   // Register TTKernel dialect so its types/ops are available.
